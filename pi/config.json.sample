@@ -5,6 +5,9 @@
   "http_timeout_seconds": 10,
   "web_port": 8080,
   "web_token": "",
+  "web_base_url": "",
+  "pushover_app_token": "",
+  "pushover_user_key": "",
   "agent_token": "CHANGE-ME-to-a-long-random-string",
   "screenshot_api_token": "",
 

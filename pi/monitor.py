@@ -38,7 +38,8 @@ from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QBrush, QPixmap
 from PyQt6.QtWidgets import QApplication, QWidget
 
 CONFIG_PATH  = Path(__file__).with_name("config.json")
-HISTORY_PATH = Path(__file__).with_name("history.json")
+HISTORY_PATH     = Path(__file__).with_name("history.json")
+NOTIF_STATE_PATH = Path(__file__).with_name("notif_state.json")
 HISTORY_MAX  = 240  # data points kept per site (~2 hours at 30s intervals)
 
 _web_lock          = threading.Lock()
@@ -47,6 +48,11 @@ _web_thumbs: dict  = {}   # url → png bytes, shared with web handler
 _web_fetch_pending: set = set()
 _screenshot_api_token: str = ""
 _web_token: str = ""
+_web_base_url: str = ""
+_pushover_app_token: str = ""
+_pushover_user_key:  str = ""
+_notif_consecutive: dict = {}   # site key → consecutive red count
+_notif_alerted:     set  = set()  # site keys currently in down-alert state
 
 # ---- palette (kept tiny: dark bg is cheap to repaint on SPI) -------------
 BG       = QColor("#11141a")
@@ -77,6 +83,84 @@ def save_history(history: dict):
         HISTORY_PATH.write_text(json.dumps(history))
     except Exception:
         pass
+
+def _load_notif_state():
+    global _notif_alerted
+    try:
+        if NOTIF_STATE_PATH.exists():
+            _notif_alerted = set(json.loads(NOTIF_STATE_PATH.read_text()))
+    except Exception:
+        pass
+
+def _save_notif_state():
+    try:
+        NOTIF_STATE_PATH.write_text(json.dumps(list(_notif_alerted)))
+    except Exception:
+        pass
+
+def _monitor_url(name: str) -> str:
+    if not _web_base_url:
+        return ""
+    p = {"site": name}
+    if _web_token:
+        p["auth"] = _web_token
+    return f"{_web_base_url}/?{urllib.parse.urlencode(p)}"
+
+def _send_pushover(title: str, message: str, site_url: str = "", monitor_url: str = ""):
+    try:
+        if site_url:
+            message += "\n" + site_url
+        data = urllib.parse.urlencode({
+            "token":     _pushover_app_token,
+            "user":      _pushover_user_key,
+            "title":     title,
+            "message":   message,
+            "url":       monitor_url or site_url,
+            "url_title": "Open monitor" if monitor_url else "Open site",
+        }).encode()
+        req = urllib.request.Request(
+            "https://api.pushover.net/1/messages.json",
+            data=data, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            result = json.loads(resp.read())
+        print(f"[pushover] sent '{title}': {result.get('status')}", flush=True)
+    except Exception as e:
+        print(f"[pushover] failed: {e}", flush=True)
+
+
+def _check_notifications(results: list):
+    if not _pushover_app_token or not _pushover_user_key:
+        return
+    if any(r.net_down for r in results):
+        return   # Pi lost network — not a site issue, don't alert
+    for r in results:
+        key    = r.url or r.name
+        is_red = not r.host_ok or not r.page_ok
+        if is_red:
+            _notif_consecutive[key] = _notif_consecutive.get(key, 0) + 1
+            if _notif_consecutive[key] == 2 and key not in _notif_alerted:
+                _notif_alerted.add(key)
+                _save_notif_state()
+                msg = r.error or ("host unreachable" if not r.host_ok else "page check failed")
+                threading.Thread(
+                    target=_send_pushover,
+                    args=(f"DOWN: {r.name}", msg, r.url, _monitor_url(r.name)),
+                    daemon=True,
+                ).start()
+        else:
+            was_alerted = key in _notif_alerted
+            _notif_consecutive[key] = 0
+            _notif_alerted.discard(key)
+            if was_alerted:
+                _save_notif_state()
+                threading.Thread(
+                    target=_send_pushover,
+                    args=(f"BACK UP: {r.name}", f"{r.name} is responding normally",
+                          r.url, _monitor_url(r.name)),
+                    daemon=True,
+                ).start()
+
 
 def _web_thumb_fetch(url: str):
     try:
@@ -116,7 +200,7 @@ def append_history(history: dict, results: list):
         key = r.url or r.name
         entry = {
             "t": t,
-            "host_ok": r.host_ok, "page_ok": r.page_ok,
+            "host_ok": r.host_ok, "page_ok": r.page_ok, "net_down": r.net_down,
             "http": r.http_status, "ms": r.response_ms, "grep": r.grep_found,
             "cpu":  r.cpu.get("percent")  if r.cpu    else None,
             "mem":  r.memory.get("percent") if r.memory else None,
@@ -149,6 +233,7 @@ class SiteResult:
     error: str = ""
     has_agent: bool = False
     skip_disk: bool = False
+    net_down: bool = False   # True when Pi itself lost network (all sites failed)
 
 
 def _status_priority(r: SiteResult) -> int:
@@ -196,6 +281,15 @@ class Poller(QThread):
             with ThreadPoolExecutor(max_workers=len(sites) or 1) as ex:
                 futures = [ex.submit(self.check_site, s) for s in sites]
                 results = [f.result() for f in futures]
+            # If every site failed with a network-level error (not an HTTP error),
+            # the Pi itself has lost connectivity — flag grey rather than red.
+            _net_errors = {'URLError', 'gaierror', 'TimeoutError',
+                           'ConnectionRefusedError', 'OSError'}
+            if results and all(
+                not r.host_ok and r.error in _net_errors for r in results
+            ):
+                for r in results:
+                    r.net_down = True
             self.updated.emit(results)
             for _ in range(interval * 2):
                 if not self._running or self._force.is_set():
@@ -348,7 +442,7 @@ button:hover{border-color:#7c8597;color:#e6e9ef}
 .card-top{display:flex;align-items:center;gap:8px;padding-bottom:8px}
 .dots{display:flex;flex-direction:column;gap:5px}
 .dot{width:13px;height:13px;border-radius:50%;flex-shrink:0}
-.g{background:#3ec46d}.r{background:#e1543f}
+.g{background:#3ec46d}.r{background:#e1543f}.m{background:#7c8597}
 .info{flex:1;min-width:0;overflow:hidden;max-width:calc(100vw - 200px)}
 .nm{font-size:14px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .tt{color:#7c8597;font-size:10px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -412,7 +506,7 @@ function hcanv(c,hist,skip){
   c.width=Math.round(w*dpr);c.height=Math.round(h*dpr);
   c.style.width='100%';c.style.height=h+'px';
   const x=c.getContext('2d');x.scale(dpr,dpr);
-  const rows=[[0,e=>e.host_ok?G:R],[3,e=>e.page_ok?G:R],
+  const rows=[[0,e=>e.net_down?M:(e.host_ok?G:R)],[3,e=>e.net_down?M:(e.page_ok?G:R)],
     [6,e=>e.cpu!=null?gc(e.cpu):T],[9,e=>e.mem!=null?gc(e.mem):T],
     [12,e=>(!skip&&e.disk!=null)?gc(e.disk):T]];
   const n=hist.length,bw=w/n;
@@ -437,7 +531,7 @@ function render(d){
                :'<span class="htag">'+(s.has_agent?(s.error||'no data'):'HTTP only')+'</span>';
     return '<div class="card" data-i="'+i+'">'
       +'<div class="card-top">'
-      +'<div class="dots"><div class="dot '+(s.host_ok?'g':'r')+'"></div><div class="dot '+(s.page_ok?'g':'r')+'"></div></div>'
+      +'<div class="dots"><div class="dot '+(s.net_down?'m':s.host_ok?'g':'r')+'"></div><div class="dot '+(s.net_down?'m':s.page_ok?'g':'r')+'"></div></div>'
       +'<div class="info"><div class="nm">'+esc(s.name)+'</div>'+(s.title?'<div class="tt">'+esc(s.title)+'</div>':'')+'</div>'
       +ga+'</div>'
       +'<canvas class="hist" data-i="'+i+'"></canvas></div>';
@@ -536,8 +630,17 @@ function updateAgo(){
   const s=Math.max(0,Math.round(Date.now()/1000-data.last_update));
   document.getElementById('ago').textContent=s<60?s+'s ago':Math.floor(s/60)+'m '+s%60+'s ago';
 }
+let _deepLinked=false;
 async function load(){
-  try{const r=await fetch('/api/status');render(await r.json())}catch(e){console.error(e)}
+  try{
+    const r=await fetch('/api/status');render(await r.json());
+    if(!_deepLinked){
+      _deepLinked=true;
+      const sn=new URLSearchParams(location.search).get('site');
+      if(sn&&data){const idx=data.sites.findIndex(s=>s.name===sn);if(idx>=0)openModal(idx);}
+      history.replaceState(null,'',location.pathname);
+    }
+  }catch(e){console.error(e)}
 }
 load();setInterval(load,35000);setInterval(updateAgo,5000);
 </script>
@@ -568,6 +671,21 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(_LOGIN_HTML)
             return
+
+        # One-shot URL auth: ?auth=TOKEN sets cookie and redirects without it
+        if not self._is_authed() and _web_token:
+            auth_param = params.get('auth', [''])[0]
+            if auth_param == _web_token:
+                clean_qs = urllib.parse.urlencode(
+                    {k: v[0] for k, v in params.items() if k != 'auth'}
+                )
+                dest = path + ('?' + clean_qs if clean_qs else '')
+                self.send_response(302)
+                self.send_header('Location', dest)
+                self.send_header('Set-Cookie',
+                    f'piping_auth={_web_token}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax')
+                self.end_headers()
+                return
 
         if not self._is_authed():
             self.send_response(302)
@@ -645,6 +763,11 @@ class _WebServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], BrokenPipeError):
+            return
+        super().handle_error(request, client_address)
+
 
 def start_web_server(port: int):
     server = _WebServer(("", port), _WebHandler)
@@ -715,8 +838,8 @@ class Panel(QWidget):
         # 5 lines × 2px + 4 gaps × 1px = 14px total
         # order top→bottom: host, page, CPU, MEM, DSK
         BARS = [
-            (0,  lambda e: GREEN if e["host_ok"] else RED),
-            (3,  lambda e: GREEN if e["page_ok"] else RED),
+            (0,  lambda e: MUTED if e.get("net_down") else (GREEN if e["host_ok"] else RED)),
+            (3,  lambda e: MUTED if e.get("net_down") else (GREEN if e["page_ok"] else RED)),
             (6,  lambda e: _gauge_col(e["cpu"])  if e.get("cpu")  is not None else TRACK),
             (9,  lambda e: _gauge_col(e["mem"])  if e.get("mem")  is not None else TRACK),
             (12, lambda e: _gauge_col(e["disk"]) if e.get("disk") is not None else TRACK),
@@ -757,6 +880,7 @@ class Panel(QWidget):
                 if r.name == detail_name:
                     self.detail_index = i
                     break
+        _check_notifications(self.results)
         self._rebuild_hist_pixmaps()
         self.last_update = time.time()
         _make_web_snapshot(self.results, self.history, self.last_update)
@@ -853,8 +977,8 @@ class Panel(QWidget):
                 p.fillRect(QRectF(0, top, 320, ROW_H), PANEL)
 
             cy = top + (ROW_H - 14) / 2
-            self._light(p, 13, cy, r.host_ok)
-            self._light(p, 32, cy, r.page_ok)
+            self._light(p, 13, cy, r.host_ok, grey=r.net_down)
+            self._light(p, 32, cy, r.page_ok, grey=r.net_down)
 
             name_y = top + (ROW_H - 14 - 35) / 2
             p.setPen(TEXT)
@@ -950,8 +1074,8 @@ class Panel(QWidget):
         hist = self.history.get(r.url or r.name, [])
         if hist:
             sep()
-            host_cols = [GREEN if e["host_ok"] else RED for e in hist]
-            page_cols = [GREEN if e["page_ok"] else RED for e in hist]
+            host_cols = [MUTED if e.get("net_down") else (GREEN if e["host_ok"] else RED) for e in hist]
+            page_cols = [MUTED if e.get("net_down") else (GREEN if e["page_ok"] else RED) for e in hist]
             self._history_dots(p, y, 14, host_cols, "host")
             y += 16
             self._history_dots(p, y, 14, page_cols, "page")
@@ -1084,8 +1208,8 @@ class Panel(QWidget):
             p.drawText(QRectF(BAR_X + BAR_W + 2, y, VAL_W, h),
                        Qt.AlignmentFlag.AlignVCenter, f"{last_pct}%")
 
-    def _light(self, p, cx, cy, ok):
-        col = GREEN if ok else RED
+    def _light(self, p, cx, cy, ok, grey=False):
+        col = MUTED if grey else (GREEN if ok else RED)
         p.setBrush(QBrush(col)); p.setPen(Qt.PenStyle.NoPen)
         p.drawEllipse(QPointF(cx, cy), 7, 7)
 
@@ -1119,9 +1243,13 @@ def main():
         sys.exit(1)
     config = json.loads(CONFIG_PATH.read_text())
 
-    global _screenshot_api_token, _web_token
+    global _screenshot_api_token, _web_token, _web_base_url, _pushover_app_token, _pushover_user_key
     _screenshot_api_token = config.get("screenshot_api_token", "")
     _web_token            = config.get("web_token", "")
+    _web_base_url         = config.get("web_base_url", "").rstrip("/")
+    _pushover_app_token   = config.get("pushover_app_token", "")
+    _pushover_user_key    = config.get("pushover_user_key", "")
+    _load_notif_state()
 
     start_web_server(config.get("web_port", 8080))
 
