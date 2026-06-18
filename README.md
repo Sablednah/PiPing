@@ -80,7 +80,13 @@ git clone https://github.com/Sablednah/PiPing.git
 cd PiPing
 ```
 
-Edit `pi/config.json` — at minimum set a strong `agent_token` and add your sites (see [Configuration](#configuration) below).
+Copy the sample config and edit it — at minimum set a strong `agent_token` and add your sites (see [Configuration](#configuration) below):
+
+```bash
+cp pi/config.json.sample pi/config.json
+```
+
+`pi/config.json` is gitignored so your live site list and token stay local.
 
 Push to the Pi:
 
@@ -111,6 +117,8 @@ ssh sable@<pi-ip> "journalctl -fu monitor.service"
 ---
 
 ## Configuration
+
+Copy `pi/config.json.sample` to `pi/config.json` and edit it. The file is gitignored so it stays local.
 
 `pi/config.json`:
 

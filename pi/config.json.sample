@@ -1,0 +1,28 @@
+{
+  "_comment": "Add a site by copying a block. Entries with 'agent' get full server stats AND the outsider HTTP check. Entries with only 'url' get the HTTP 200 + grep + title check from the Pi (no server gauges). 'grep' is a phrase that MUST appear in the page HTML to count as a real load.",
+
+  "poll_interval_seconds": 30,
+  "http_timeout_seconds": 10,
+  "agent_token": "CHANGE-ME-to-a-long-random-string",
+
+  "sites": [
+    {
+      "name": "My Site",
+      "url": "https://example.com/",
+      "agent": "https://example.com/_status/status.php",
+      "grep": "Expected phrase on the page"
+    },
+    {
+      "name": "Another Site",
+      "url": "https://another-example.com/",
+      "agent": "https://another-example.com/_status/status.php",
+      "grep": "Copyright 2026"
+    },
+    {
+      "name": "HTTP Only",
+      "url": "https://http-only-example.com/",
+      "agent": null,
+      "grep": "Some phrase to check for"
+    }
+  ]
+}
