@@ -35,7 +35,7 @@ from PyQt6.QtWidgets import QApplication, QWidget
 
 CONFIG_PATH  = Path(__file__).with_name("config.json")
 HISTORY_PATH = Path(__file__).with_name("history.json")
-HISTORY_MAX  = 30   # data points kept per site
+HISTORY_MAX  = 240  # data points kept per site (~2 hours at 30s intervals)
 
 # ---- palette (kept tiny: dark bg is cheap to repaint on SPI) -------------
 BG       = QColor("#11141a")
@@ -610,7 +610,7 @@ class Panel(QWidget):
         LABEL_W = 28
         VAL_W   = 28
         BAR_X   = 12 + LABEL_W
-        BAR_W   = 295 - LABEL_W - VAL_W
+        BAR_W   = 296 - LABEL_W - VAL_W
         p.setPen(MUTED)
         p.setFont(QFont("DejaVu Sans", 6))
         p.drawText(QRectF(12, y, LABEL_W, h), Qt.AlignmentFlag.AlignVCenter, label)
