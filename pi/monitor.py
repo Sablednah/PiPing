@@ -258,6 +258,10 @@ class Panel(QWidget):
         # Sort: red → amber → green, stable within each group (preserves config order).
         self.results = [r for _, r in sorted(enumerate(results),
                                              key=lambda x: (_status_priority(x[1]), x[0]))]
+        # drop cached screenshots for non-green sites so the next detail-tap fetches a fresh one
+        for r in self.results:
+            if _status_priority(r) < 2:
+                self._thumb_cache.pop(r.url, None)
         if detail_name is not None:
             for i, r in enumerate(self.results):
                 if r.name == detail_name:
