@@ -16,6 +16,8 @@ echo "Deploying to ${PI_HOST}:${DEST}"
 
 rsync -avz --delete \
   --exclude '__pycache__' \
+  --exclude 'history.json' \
+  --exclude 'config.json' \
   "$(dirname "$0")/pi/" \
   "${PI_HOST}:${DEST}"
 
