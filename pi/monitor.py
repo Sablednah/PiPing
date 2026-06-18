@@ -26,6 +26,7 @@ import threading
 import urllib.request
 import urllib.error
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -47,7 +48,7 @@ AMBER    = QColor("#e7b54a")
 RED      = QColor("#e1543f")
 TRACK    = QColor("#2b3140")
 
-ROW_H = 72   # fixed row height — enables scrolling regardless of site count
+ROW_H = 64   # fixed row height — enables scrolling regardless of site count
 
 
 # ---------------------------------------------------------------------------
@@ -146,11 +147,13 @@ class Poller(QThread):
 
     def run(self):
         interval = self.config.get("poll_interval_seconds", 30)
+        sites = self.config.get("sites", [])
         while self._running:
             self._force.clear()
-            results = [self.check_site(s) for s in self.config.get("sites", [])]
+            with ThreadPoolExecutor(max_workers=len(sites) or 1) as ex:
+                futures = [ex.submit(self.check_site, s) for s in sites]
+                results = [f.result() for f in futures]
             self.updated.emit(results)
-            # sleep in small slices so stop() and force_poll() are responsive
             for _ in range(interval * 2):
                 if not self._running or self._force.is_set():
                     break
