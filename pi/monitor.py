@@ -430,6 +430,18 @@ class Panel(QWidget):
                 tag = "HTTP only" if not r.has_agent else (r.error or "no data")
                 p.drawText(QRectF(185, top, 130, ROW_H), Qt.AlignmentFlag.AlignCenter, tag)
 
+            # history bars — two 2px lines at bottom of card
+            hist = self.history.get(r.url or r.name, [])
+            if hist:
+                n = len(hist)
+                bw = 317 / n
+                for i, e in enumerate(hist):
+                    x = i * bw
+                    p.fillRect(QRectF(x, top + ROW_H - 6, max(1, bw), 2),
+                               GREEN if e["host_ok"] else RED)
+                    p.fillRect(QRectF(x, top + ROW_H - 3, max(1, bw), 2),
+                               GREEN if e["page_ok"] else RED)
+
         p.setClipping(False)
 
         total_h = len(self.results) * ROW_H
