@@ -23,6 +23,9 @@ import json
 import time
 import re
 import threading
+import dataclasses
+import http.server
+import socketserver
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -37,6 +40,13 @@ from PyQt6.QtWidgets import QApplication, QWidget
 CONFIG_PATH  = Path(__file__).with_name("config.json")
 HISTORY_PATH = Path(__file__).with_name("history.json")
 HISTORY_MAX  = 240  # data points kept per site (~2 hours at 30s intervals)
+
+_web_lock          = threading.Lock()
+_web_snapshot      = b'{"sites":[],"last_update":0}'
+_web_thumbs: dict  = {}   # url → png bytes, shared with web handler
+_web_fetch_pending: set = set()
+_screenshot_api_token: str = ""
+_web_token: str = ""
 
 # ---- palette (kept tiny: dark bg is cheap to repaint on SPI) -------------
 BG       = QColor("#11141a")
@@ -67,6 +77,38 @@ def save_history(history: dict):
         HISTORY_PATH.write_text(json.dumps(history))
     except Exception:
         pass
+
+def _web_thumb_fetch(url: str):
+    try:
+        api_url = (
+            "https://shot.screenshotapi.net/screenshot"
+            f"?token={_screenshot_api_token}"
+            f"&url={urllib.parse.quote(url, safe='')}"
+            "&output=image&file_type=png"
+        )
+        req = urllib.request.Request(api_url, headers={"User-Agent": "PiStatusPanel/1.0"})
+        with urllib.request.urlopen(req, timeout=50) as resp:
+            data = resp.read()
+        if data:
+            _web_thumbs[url] = data
+            print(f"[web-thumb] cached {len(data)} bytes for {url}", flush=True)
+    except Exception as e:
+        print(f"[web-thumb] failed for {url}: {e}", flush=True)
+    finally:
+        _web_fetch_pending.discard(url)
+
+
+def _make_web_snapshot(results: list, history: dict, last_update: float):
+    global _web_snapshot
+    sites = []
+    for r in results:
+        key = r.url or r.name
+        d = dataclasses.asdict(r)
+        d["history"] = history.get(key, [])
+        sites.append(d)
+    data = json.dumps({"last_update": last_update, "sites": sites}).encode()
+    with _web_lock:
+        _web_snapshot = data
 
 def append_history(history: dict, results: list):
     t = int(time.time())
@@ -247,6 +289,371 @@ class ThumbnailFetcher(QThread):
 
 
 # ---------------------------------------------------------------------------
+# Web server (daemon thread — shares _web_snapshot with the Qt side)
+# ---------------------------------------------------------------------------
+_LOGIN_HTML = b"""\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PiPing</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#11141a;color:#e6e9ef;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}
+.box{background:#1b1f29;border-radius:8px;padding:28px;width:100%;max-width:320px}
+h1{font-size:18px;font-weight:700;margin-bottom:20px}
+label{font-size:12px;color:#7c8597;display:block;margin-bottom:6px}
+input{width:100%;background:#11141a;border:1px solid #2b3140;color:#e6e9ef;padding:9px 11px;border-radius:4px;font-size:15px;margin-bottom:14px}
+input:focus{outline:none;border-color:#7c8597}
+button{width:100%;background:#3ec46d;color:#11141a;border:none;padding:11px;border-radius:4px;font-size:14px;font-weight:700;cursor:pointer}
+#err{color:#e1543f;font-size:12px;margin-bottom:12px;min-height:16px}
+</style>
+</head>
+<body>
+<div class="box">
+<h1>PiPing</h1>
+<form method="POST" action="/login">
+<label for="k">Access key</label>
+<input type="password" name="key" id="k" autofocus autocomplete="current-password">
+<p id="err"></p>
+<button type="submit">Enter</button>
+</form>
+</div>
+<script>if(location.search.indexOf('err')>-1)document.getElementById('err').textContent='Incorrect key'</script>
+</body>
+</html>
+"""
+
+_WEB_HTML = b"""\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PiPing</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#11141a;color:#e6e9ef;font-family:system-ui,sans-serif}
+header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid #2b3140;position:sticky;top:0;background:#11141a;z-index:10}
+h1{font-size:17px;font-weight:700}
+#ago{color:#7c8597;font-size:12px}
+button{background:none;border:1px solid #2b3140;color:#7c8597;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px}
+button:hover{border-color:#7c8597;color:#e6e9ef}
+#grid{padding:8px;display:grid;gap:6px;grid-template-columns:1fr}
+@media(min-width:560px){#grid{grid-template-columns:1fr 1fr}}
+@media(min-width:900px){#grid{grid-template-columns:repeat(3,1fr)}}
+.card{background:#1b1f29;border-radius:6px;padding:10px 10px 0;cursor:pointer;transition:background .15s}
+.card:hover{background:#212636}
+.card-top{display:flex;align-items:center;gap:8px;padding-bottom:8px}
+.dots{display:flex;flex-direction:column;gap:5px}
+.dot{width:13px;height:13px;border-radius:50%;flex-shrink:0}
+.g{background:#3ec46d}.r{background:#e1543f}
+.info{flex:1;min-width:0;overflow:hidden;max-width:calc(100vw - 200px)}
+.nm{font-size:14px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tt{color:#7c8597;font-size:10px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gauges{display:flex;gap:1px;flex-shrink:0;margin-left:auto}
+.htag{color:#7c8597;font-size:10px;padding:0 6px}
+canvas.hist{display:block;width:100%;max-width:100%;height:14px}
+#ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:100;align-items:flex-end;justify-content:center}
+#ov.open{display:flex}
+#modal{background:#1b1f29;border-radius:12px 12px 0 0;width:100%;max-width:600px;max-height:88vh;overflow-y:auto;padding:16px 16px 24px}
+@media(min-width:640px){#ov{align-items:center}#modal{border-radius:12px;max-height:80vh}}
+.mhdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.mhdr h2{font-size:16px;font-weight:700}
+.mhdr button{border:none;font-size:20px;padding:2px 6px;line-height:1}
+hr{border:none;border-top:1px solid #2b3140;margin:10px 0}
+.tags{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px}
+.tag{display:inline-block;padding:3px 7px;border-radius:3px;font-size:11px;font-weight:600}
+.ok{background:#1a3328;color:#3ec46d}.er{background:#3a1a17;color:#e1543f}.dm{background:#1b2030;color:#7c8597}
+.srow{display:flex;gap:8px;margin-bottom:5px;font-size:12px}
+.sl{color:#7c8597;width:64px;flex-shrink:0}
+.sv{font-family:monospace}
+.sp{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.sp-l{color:#7c8597;font-size:11px;width:32px;flex-shrink:0}
+.sp-c{flex:1;height:24px;background:#2b3140;border-radius:2px}
+.sp-v{font-size:12px;font-weight:700;width:36px;text-align:right;flex-shrink:0}
+</style>
+</head>
+<body>
+<header>
+  <h1>PiPing</h1>
+  <div style="display:flex;align-items:center;gap:10px">
+    <span id="ago">&#8212;</span>
+    <button onclick="load()">Refresh</button>
+  </div>
+</header>
+<div id="grid"><p style="color:#7c8597;padding:24px;text-align:center">Loading&#8230;</p></div>
+<div id="ov" onclick="if(event.target===this)closeModal()">
+  <div id="modal">
+    <div class="mhdr"><h2 id="mt">&#8212;</h2><button onclick="closeModal()">&#x2715;</button></div>
+    <div id="mb"></div>
+  </div>
+</div>
+<script>
+const G='#3ec46d',A='#e7b54a',R='#e1543f',T='#2b3140',M='#7c8597';
+let data=null;
+function gc(p){return p<70?G:p<90?A:R}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function arc(pct,lbl,naText){
+  const r=14,cx=18,cy=18,C=+(2*Math.PI*r).toFixed(2);
+  const col=pct!=null?gc(pct):T,off=pct!=null?+(C-C*pct/100).toFixed(2):C,txt=pct!=null?pct:(naText||'&#8212;');
+  return '<svg width="36" height="36" viewBox="0 0 36 36" style="flex-shrink:0">'
+    +'<circle cx="'+cx+'" cy="'+cy+'" r="'+r+'" fill="none" stroke="'+T+'" stroke-width="3.5"/>'
+    +(pct!=null?'<circle cx="'+cx+'" cy="'+cy+'" r="'+r+'" fill="none" stroke="'+col+'" stroke-width="3.5" stroke-dasharray="'+C+'" stroke-dashoffset="'+off+'" transform="rotate(-90 '+cx+' '+cy+')"/>'
+:'')
+    +'<text x="'+cx+'" y="'+(cy-3)+'" text-anchor="middle" fill="'+M+'" font-size="5.5" font-family="sans-serif">'+lbl+'</text>'
+    +'<text x="'+cx+'" y="'+(cy+7)+'" text-anchor="middle" fill="'+(pct!=null?'#e6e9ef':M)+'" font-size="8.5" font-weight="bold" font-family="monospace">'+txt+'</text>'
+    +'</svg>';
+}
+function hcanv(c,hist,skip){
+  if(!hist||!hist.length)return;
+  const dpr=devicePixelRatio||1,w=c.offsetWidth||320,h=14;
+  c.width=Math.round(w*dpr);c.height=Math.round(h*dpr);
+  c.style.width='100%';c.style.height=h+'px';
+  const x=c.getContext('2d');x.scale(dpr,dpr);
+  const rows=[[0,e=>e.host_ok?G:R],[3,e=>e.page_ok?G:R],
+    [6,e=>e.cpu!=null?gc(e.cpu):T],[9,e=>e.mem!=null?gc(e.mem):T],
+    [12,e=>(!skip&&e.disk!=null)?gc(e.disk):T]];
+  const n=hist.length,bw=w/n;
+  for(const[y,cf]of rows)for(let i=0;i<n;i++){x.fillStyle=cf(hist[i]);x.fillRect(i*bw,y,Math.max(1,bw),2)}
+}
+function spark(c,vals,h){
+  if(!vals||!vals.length)return;
+  const dpr=devicePixelRatio||1,w=c.offsetWidth||200;
+  c.width=Math.round(w*dpr);c.height=Math.round(h*dpr);
+  const x=c.getContext('2d');x.scale(dpr,dpr);
+  x.fillStyle=T;x.fillRect(0,0,w,h);
+  const n=vals.length,bw=w/n;
+  for(let i=0;i<n;i++){const bh=Math.max(1,Math.round((h-2)*vals[i]/100));x.fillStyle=gc(vals[i]);x.fillRect(i*bw,h-1-bh,Math.max(1,bw-1),bh)}
+}
+function render(d){
+  data=d;
+  const g=document.getElementById('grid');
+  if(!d.sites||!d.sites.length){g.innerHTML='<p style="color:#7c8597;padding:24px;text-align:center">No sites</p>';return}
+  g.innerHTML=d.sites.map((s,i)=>{
+    const hg=s.has_agent&&(s.cpu||s.memory||s.disk);
+    const ga=hg?'<div class="gauges">'+arc(s.cpu?s.cpu.percent:null,'CPU',null)+arc(s.memory?s.memory.percent:null,'MEM',null)+arc(s.skip_disk?null:(s.disk?s.disk.percent:null),'DSK',s.skip_disk?'NA':null)+'</div>'
+               :'<span class="htag">'+(s.has_agent?(s.error||'no data'):'HTTP only')+'</span>';
+    return '<div class="card" data-i="'+i+'">'
+      +'<div class="card-top">'
+      +'<div class="dots"><div class="dot '+(s.host_ok?'g':'r')+'"></div><div class="dot '+(s.page_ok?'g':'r')+'"></div></div>'
+      +'<div class="info"><div class="nm">'+esc(s.name)+'</div>'+(s.title?'<div class="tt">'+esc(s.title)+'</div>':'')+'</div>'
+      +ga+'</div>'
+      +'<canvas class="hist" data-i="'+i+'"></canvas></div>';
+  }).join('');
+  g.querySelectorAll('.card').forEach(c=>c.addEventListener('click',()=>openModal(+c.dataset.i)));
+  requestAnimationFrame(()=>{g.querySelectorAll('canvas.hist').forEach(c=>{const s=d.sites[+c.dataset.i];hcanv(c,s.history,s.skip_disk)})});
+}
+function openModal(i){
+  const s=data.sites[i],hist=s.history||[];
+  document.getElementById('mt').textContent=s.name;
+  let h='<div class="tags">'
+    +'<span class="tag '+(!s.host_ok||!s.page_ok?'er':'ok')+'">'+((!s.host_ok||!s.page_ok)?'DOWN':'UP')+'</span>';
+  if(s.http_status)h+='<span class="tag '+(s.http_status===200?'ok':'er')+'">HTTP '+s.http_status+'</span>';
+  if(s.response_ms)h+='<span class="tag dm">'+s.response_ms+'ms</span>';
+  if(s.grep_phrase)h+='<span class="tag '+(s.grep_found?'ok':'er')+'">grep '+(s.grep_found?'&#10003;':'&#10007;')+'</span>';
+  h+='</div>';
+  if(s.title)h+='<p style="color:'+M+';font-size:12px;margin-bottom:8px">'+esc(s.title)+'</p>';
+  if(s.error)h+='<p style="color:'+R+';font-size:12px;margin-bottom:8px">'+esc(s.error)+'</p>';
+  if(hist.length){
+    h+='<hr><div style="font-size:11px;color:'+M+';margin-bottom:6px">History ('+hist.length+' polls)</div>'
+      +'<canvas id="mh1" style="display:block;width:100%;height:14px;margin-bottom:3px"></canvas>'
+      +'<canvas id="mh2" style="display:block;width:100%;height:14px;margin-bottom:6px"></canvas>';
+  }
+  const cpu=hist.filter(e=>e.cpu!=null).map(e=>e.cpu);
+  const mem=hist.filter(e=>e.mem!=null).map(e=>e.mem);
+  const dsk=s.skip_disk?[]:hist.filter(e=>e.disk!=null).map(e=>e.disk);
+  if(cpu.length||mem.length||dsk.length){
+    h+='<hr>';
+    if(cpu.length)h+='<div class="sp"><span class="sp-l">CPU</span><canvas id="msc" class="sp-c"></canvas><span class="sp-v" style="color:'+gc(cpu[cpu.length-1])+'">'+cpu[cpu.length-1]+'%</span></div>';
+    if(mem.length)h+='<div class="sp"><span class="sp-l">MEM</span><canvas id="msm" class="sp-c"></canvas><span class="sp-v" style="color:'+gc(mem[mem.length-1])+'">'+mem[mem.length-1]+'%</span></div>';
+    if(dsk.length)h+='<div class="sp"><span class="sp-l">DSK</span><canvas id="msd" class="sp-c"></canvas><span class="sp-v" style="color:'+gc(dsk[dsk.length-1])+'">'+dsk[dsk.length-1]+'%</span></div>';
+  }
+  if(s.cpu||s.memory||(s.disk&&!s.skip_disk)){
+    h+='<hr>';
+    if(s.cpu)h+='<div class="srow"><span class="sl">CPU</span><span class="sv">'+s.cpu.percent+'% &nbsp;load '+s.cpu.load1+' / '+s.cpu.cores+' cores</span></div>';
+    if(s.memory)h+='<div class="srow"><span class="sl">Memory</span><span class="sv">'+s.memory.percent+'% &nbsp;('+s.memory.used_mb+' / '+s.memory.total_mb+' MB)</span></div>';
+    if(s.disk&&!s.skip_disk)h+='<div class="srow"><span class="sl">Disk</span><span class="sv">'+s.disk.percent+'% &nbsp;('+s.disk.used_gb+' / '+s.disk.total_gb+' GB)</span></div>';
+    else if(s.skip_disk)h+='<div class="srow"><span class="sl">Disk</span><span class="sv" style="color:'+M+'">N/A (unlimited hosting)</span></div>';
+  }else if(!s.has_agent){
+    h+='<hr><p style="color:'+M+';font-size:12px">HTTP-only &#8212; no agent installed</p>';
+  }
+  if(s.url){
+    h+='<hr><img id="mthumb" src="/api/thumb?url='+encodeURIComponent(s.url)+'" style="width:100%;border-radius:4px;display:none">'
+      +'<p id="mthumb-msg" style="color:#7c8597;font-size:11px;margin-top:4px;display:none">Preview not cached yet &mdash; open detail on the panel first</p>';
+  }
+  document.getElementById('mb').innerHTML=h;
+  const ti=document.getElementById('mthumb');
+  if(ti){
+    ti.onload=function(){this.style.display='block';const m=document.getElementById('mthumb-msg');if(m)m.remove()};
+    ti.onerror=function(){
+      this.remove();
+      const m=document.getElementById('mthumb-msg');
+      if(!m)return;
+      m.textContent='Loading preview...';m.style.display='block';
+      fetch('/api/fetch-thumb?url='+encodeURIComponent(s.url)).then(function(){
+        let n=0;
+        const poll=setInterval(function(){
+          n++;
+          fetch('/api/thumb?url='+encodeURIComponent(s.url)).then(function(r){
+            if(r.ok){
+              clearInterval(poll);
+              const img=document.createElement('img');
+              img.src='/api/thumb?url='+encodeURIComponent(s.url)+'&_='+n;
+              img.style.cssText='width:100%;border-radius:4px';
+              m.replaceWith(img);
+            }else if(n>=12){clearInterval(poll);m.textContent='Preview unavailable'}
+          }).catch(function(){if(n>=12)clearInterval(poll)});
+        },5000);
+      }).catch(function(){m.textContent='Preview unavailable'});
+    };
+  }
+  document.getElementById('ov').classList.add('open');
+  requestAnimationFrame(()=>{
+    if(hist.length){
+      const h1=document.getElementById('mh1'),h2=document.getElementById('mh2');
+      if(h1){
+        const dpr=devicePixelRatio||1,w=h1.offsetWidth,n=hist.length,bw=w/n;
+        [h1,h2].forEach(c=>{c.width=Math.round(w*dpr);c.height=Math.round(14*dpr)});
+        const c1=h1.getContext('2d'),c2=h2.getContext('2d');
+        c1.scale(dpr,dpr);c2.scale(dpr,dpr);
+        for(let i=0;i<n;i++){
+          c1.fillStyle=hist[i].host_ok?G:R;c1.fillRect(i*bw,6,Math.max(1,bw),2);
+          c2.fillStyle=hist[i].page_ok?G:R;c2.fillRect(i*bw,6,Math.max(1,bw),2);
+        }
+      }
+    }
+    const sc=document.getElementById('msc'),sm=document.getElementById('msm'),sd=document.getElementById('msd');
+    if(sc&&cpu.length)spark(sc,cpu,24);
+    if(sm&&mem.length)spark(sm,mem,24);
+    if(sd&&dsk.length)spark(sd,dsk,24);
+  });
+}
+function closeModal(){document.getElementById('ov').classList.remove('open')}
+function updateAgo(){
+  if(!data)return;
+  const s=Math.max(0,Math.round(Date.now()/1000-data.last_update));
+  document.getElementById('ago').textContent=s<60?s+'s ago':Math.floor(s/60)+'m '+s%60+'s ago';
+}
+async function load(){
+  try{const r=await fetch('/api/status');render(await r.json())}catch(e){console.error(e)}
+}
+load();setInterval(load,35000);setInterval(updateAgo,5000);
+</script>
+</body>
+</html>
+"""
+
+class _WebHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_): pass   # silence access log
+
+    def _is_authed(self):
+        if not _web_token:
+            return True
+        for part in self.headers.get('Cookie', '').split(';'):
+            k, _, v = part.strip().partition('=')
+            if k.strip() == 'piping_auth' and v.strip() == _web_token:
+                return True
+        return False
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path   = parsed.path
+        params = urllib.parse.parse_qs(parsed.query)
+
+        if path == '/login':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(_LOGIN_HTML)
+            return
+
+        if not self._is_authed():
+            self.send_response(302)
+            self.send_header('Location', '/login')
+            self.end_headers()
+            return
+
+        if path == '/api/status':
+            with _web_lock:
+                body = _web_snapshot
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(body)
+        elif path == '/api/fetch-thumb':
+            url = params.get('url', [''])[0]
+            started = False
+            if url and _screenshot_api_token:
+                with _web_lock:
+                    if url not in _web_thumbs and url not in _web_fetch_pending:
+                        _web_fetch_pending.add(url)
+                        started = True
+                if started:
+                    threading.Thread(target=_web_thumb_fetch, args=(url,), daemon=True).start()
+            status = ('cached' if url in _web_thumbs else
+                      'pending' if url in _web_fetch_pending else
+                      'started' if started else 'unavailable')
+            self.send_response(202 if started else 200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'status': status}).encode())
+        elif path == '/api/thumb':
+            url = params.get('url', [''])[0]
+            img = _web_thumbs.get(url)
+            if img:
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/png')
+                self.send_header('Cache-Control', 'no-cache')
+                self.end_headers()
+                self.wfile.write(img)
+            else:
+                self.send_response(404)
+                self.end_headers()
+        elif path in ('/', '/index.html'):
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(_WEB_HTML)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if urllib.parse.urlparse(self.path).path != '/login':
+            self.send_response(404)
+            self.end_headers()
+            return
+        length = int(self.headers.get('Content-Length', 0))
+        body   = self.rfile.read(length).decode('utf-8', 'ignore')
+        key    = urllib.parse.parse_qs(body).get('key', [''])[0]
+        if _web_token and key == _web_token:
+            self.send_response(302)
+            self.send_header('Location', '/')
+            self.send_header('Set-Cookie',
+                f'piping_auth={_web_token}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax')
+            self.end_headers()
+        else:
+            self.send_response(302)
+            self.send_header('Location', '/login?err=1')
+            self.end_headers()
+
+
+class _WebServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def start_web_server(port: int):
+    server = _WebServer(("", port), _WebHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    print(f"[web] listening on http://0.0.0.0:{port}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 class Panel(QWidget):
@@ -297,6 +704,7 @@ class Panel(QWidget):
         self._fetchers = [f for f in self._fetchers if f.isRunning()]
         if data:
             self._thumb_cache[url] = data
+            _web_thumbs[url] = data
         else:
             self._thumb_failed.add(url)
         if self.detail_index is not None:
@@ -351,6 +759,7 @@ class Panel(QWidget):
                     break
         self._rebuild_hist_pixmaps()
         self.last_update = time.time()
+        _make_web_snapshot(self.results, self.history, self.last_update)
         self.update()
 
     # ---- input ----------------------------------------------------------
@@ -709,6 +1118,12 @@ def main():
         print(f"Config not found: {CONFIG_PATH}", file=sys.stderr)
         sys.exit(1)
     config = json.loads(CONFIG_PATH.read_text())
+
+    global _screenshot_api_token, _web_token
+    _screenshot_api_token = config.get("screenshot_api_token", "")
+    _web_token            = config.get("web_token", "")
+
+    start_web_server(config.get("web_port", 8080))
 
     app = QApplication(sys.argv)
     app.setOverrideCursor(Qt.CursorShape.BlankCursor)

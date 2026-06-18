@@ -2,6 +2,8 @@
 
 A site-monitoring kiosk for a Raspberry Pi 3B+ with a 3.5" SPI touchscreen. Displays a scrollable grid of monitored websites — status lights, response checks, grep phrase validation, and live server gauges (CPU / memory / disk) from an optional PHP agent on each host.
 
+Also serves a **web panel** on port 8080 so you can check status from any browser, with the same dark-theme grid, history sparklines, and screenshot thumbnails.
+
 ![PiPing panel](screenshot.png)
 
 ---
@@ -19,8 +21,8 @@ A site-monitoring kiosk for a Raspberry Pi 3B+ with a 3.5" SPI touchscreen. Disp
 
 ## How it works
 
-- **`pi/monitor.py`** — PyQt6 app. Polls all sites on a background thread; renders directly to `/dev/fb1` (no desktop). Two views: scrollable grid and tap-to-detail.
-- **`pi/config.json`** — list of sites and shared agent token. One-line edit to add a site.
+- **`pi/monitor.py`** — PyQt6 app. Polls all sites in parallel on a background thread; renders directly to `/dev/fb1` (no desktop). Two views: scrollable grid and tap-to-detail. Also runs a lightweight HTTP server (stdlib, no Flask) for the web panel.
+- **`pi/config.json`** — list of sites, tokens, and optional features. One-line edit to add a site.
 - **`agent/status.php`** — deploy to each web host you want server stats from. Reports CPU load, memory, and disk via non-root methods (works on shared hosting). Sites without an agent get HTTP-only checks.
 - **`pi/monitor.service`** — systemd unit for autostart on boot.
 - **`deploy.sh`** — rsync `pi/` from your dev machine to the Pi and restart the service.
@@ -69,6 +71,26 @@ sudo apt install python3-pyqt6 -y
 mkdir -p /home/sable/pi-status-panel/pi
 ```
 
+### 4. WiFi stability (recommended for always-on use)
+
+Raspberry Pi WiFi has power-saving enabled by default, which can drop the connection when idle. Disable it permanently:
+
+```bash
+sudo mkdir -p /etc/NetworkManager/conf.d
+echo -e '[connection]\nwifi.powersave=2' | sudo tee /etc/NetworkManager/conf.d/wifi-pm-off.conf
+sudo systemctl restart NetworkManager
+```
+
+### 5. Enable persistent logging (optional but useful)
+
+Lets you inspect logs from previous boots if the Pi drops off the network:
+
+```bash
+sudo mkdir -p /etc/systemd/journald.conf.d
+echo -e '[Journal]\nStorage=persistent' | sudo tee /etc/systemd/journald.conf.d/persist.conf
+sudo systemctl restart systemd-journald
+```
+
 ---
 
 ## Deploying the app
@@ -86,7 +108,7 @@ Copy the sample config and edit it — at minimum set a strong `agent_token` and
 cp pi/config.json.sample pi/config.json
 ```
 
-`pi/config.json` is gitignored so your live site list and token stay local.
+`pi/config.json` is gitignored so your live site list and tokens stay local.
 
 Push to the Pi:
 
@@ -120,13 +142,14 @@ ssh sable@<pi-ip> "journalctl -fu monitor.service"
 
 Copy `pi/config.json.sample` to `pi/config.json` and edit it. The file is gitignored so it stays local.
 
-`pi/config.json`:
-
 ```json
 {
   "poll_interval_seconds": 30,
   "http_timeout_seconds": 10,
-  "agent_token": "your-secret-token-here",
+  "web_port": 8080,
+  "web_token": "CHANGE-ME-to-a-long-random-string",
+  "agent_token": "CHANGE-ME-to-a-long-random-string",
+  "screenshot_api_token": "",
 
   "sites": [
     {
@@ -136,10 +159,17 @@ Copy `pi/config.json.sample` to `pi/config.json` and edit it. The file is gitign
       "grep": "Expected phrase on the page"
     },
     {
-      "name": "HTTP Only",
+      "name": "Shared Hosting",
       "url": "https://another.com/",
+      "agent": "https://another.com/_status/status.php",
+      "grep": "Copyright 2026",
+      "skip_disk": true
+    },
+    {
+      "name": "HTTP Only",
+      "url": "https://noagent.com/",
       "agent": null,
-      "grep": ""
+      "grep": "Some phrase"
     }
   ]
 }
@@ -147,10 +177,15 @@ Copy `pi/config.json.sample` to `pi/config.json` and edit it. The file is gitign
 
 | Field | Description |
 |-------|-------------|
+| `web_port` | Port for the web panel (default `8080`) |
+| `web_token` | Cookie-based auth token for the web panel. Leave empty to disable auth (LAN-only installs). |
+| `agent_token` | Shared secret for the PHP status agents |
+| `screenshot_api_token` | [screenshotapi.net](https://screenshotapi.net) token for thumbnails in the detail view. Leave empty to disable. |
 | `name` | Display name (keep short) |
 | `url` | Full URL for the outsider HTTP check |
 | `agent` | URL of the deployed `status.php`, or `null` for HTTP-only |
-| `grep` | A phrase that must appear in the page HTML for `page_ok` to be green. Leave empty to skip. |
+| `grep` | A phrase that must appear in the page HTML for the page check to go green. Leave empty to skip. |
+| `skip_disk` | Set `true` to hide disk gauges (useful for unlimited/shared hosting where the reported value is unreliable) |
 
 The **host light** (left dot) goes green if the server responds at all. The **page light** (right dot) goes green if the response is HTTP 200 and the grep phrase is found (or no phrase is set).
 
@@ -180,12 +215,53 @@ The agent gives you live CPU / memory / disk gauges for each host.
 
 ---
 
+## Web panel
+
+The app serves a web panel on port 8080 automatically. Access it on your LAN at:
+
+```
+http://<pi-ip>:8080
+```
+
+The web panel shows the same status grid as the touchscreen, with tap-to-detail including history sparklines and screenshot thumbnails. Thumbnails are fetched on demand (via screenshotapi.net if configured) and cached in memory until a site goes red.
+
+### Authentication
+
+Set `web_token` in `config.json` to a long random string. First visit redirects to `/login`; entering the correct key sets a cookie that lasts 30 days. Leave `web_token` empty to disable auth entirely.
+
+After editing config on the Pi directly, restart the service:
+```bash
+sudo systemctl restart monitor.service
+```
+
+### Remote access
+
+To access the panel from outside your home network:
+
+1. **Port forward** on your router: external port 80 → Pi IP port 8080 (TCP).
+
+2. **Dynamic DNS** (if your IP isn't static) — [DuckDNS](https://www.duckdns.org) is free and easy:
+   ```bash
+   mkdir -p ~/duckdns
+   # Create ~/duckdns/duck.sh:
+   echo 'url="https://www.duckdns.org/update?domains=YOURSUBDOMAIN&token=YOUR_TOKEN&ip="' \
+     | curl -k -o ~/duckdns/duck.log -K -
+   chmod 700 ~/duckdns/duck.sh
+   # Add to cron (every 5 minutes):
+   (crontab -l; echo '*/5 * * * * bash ~/duckdns/duck.sh >/dev/null 2>&1') | crontab -
+   ```
+   Then access the panel at `http://YOURSUBDOMAIN.duckdns.org`.
+
+3. Set a `web_token` — don't expose the panel to the internet without auth.
+
+---
+
 ## Using the panel
 
 | Action | Result |
 |--------|--------|
 | Swipe up/down | Scroll the site list |
-| Tap a site row | Open detail view (HTTP status, response time, title, grep result, server stats) |
+| Tap a site row | Open detail view (HTTP status, response time, title, grep result, server stats, history, screenshot) |
 | Tap anywhere in detail | Return to grid |
 | Tap the **"Site Status"** header | Force an immediate repoll |
 
@@ -209,4 +285,4 @@ Edit files on your dev machine, then:
 ./deploy.sh
 ```
 
-This rsyncs `pi/` to the Pi and restarts the service. If you change `monitor.service` itself, re-run the install command above to copy it into `/etc/systemd/system/` and reload systemd.
+This rsyncs `pi/` to the Pi and restarts the service. `pi/config.json` and `pi/history.json` are excluded from the sync so live data on the Pi is never overwritten. If you change `monitor.service` itself, re-run the install command above to copy it into `/etc/systemd/system/` and reload systemd.
