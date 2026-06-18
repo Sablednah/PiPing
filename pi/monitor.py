@@ -593,18 +593,17 @@ class Panel(QWidget):
     # ---- drawing helpers ------------------------------------------------
     def _history_dots(self, p, y, h, values, label):
         LABEL_W = 28
-        DOT_R   = 3
-        STEP    = 8
+        BAR_X   = 12 + LABEL_W
+        BAR_W   = 296 - LABEL_W - 28   # matches sparkline width
         p.setPen(MUTED)
         p.setFont(QFont("DejaVu Sans", 6))
         p.drawText(QRectF(12, y, LABEL_W, h), Qt.AlignmentFlag.AlignVCenter, label)
-        cx = 12 + LABEL_W + DOT_R
-        cy = y + h / 2
-        p.setPen(Qt.PenStyle.NoPen)
-        for col in values:
-            p.setBrush(QBrush(col))
-            p.drawEllipse(QPointF(cx, cy), DOT_R, DOT_R)
-            cx += STEP
+        n = len(values)
+        if n:
+            bw = BAR_W / n
+            ly = y + (h - 2) / 2
+            for i, col in enumerate(values):
+                p.fillRect(QRectF(BAR_X + i * bw, ly, max(1, bw), 2), col)
 
     def _sparkline(self, p, y, h, values, label):
         LABEL_W = 28
