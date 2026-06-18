@@ -302,19 +302,27 @@ class Panel(QWidget):
 
     def _rebuild_hist_pixmaps(self):
         self._hist_pixmaps.clear()
+        # 5 lines × 2px + 4 gaps × 1px = 14px total
+        # order top→bottom: host, page, CPU, MEM, DSK
+        BARS = [
+            (0,  lambda e: GREEN if e["host_ok"] else RED),
+            (3,  lambda e: GREEN if e["page_ok"] else RED),
+            (6,  lambda e: _gauge_col(e["cpu"])  if e.get("cpu")  is not None else TRACK),
+            (9,  lambda e: _gauge_col(e["mem"])  if e.get("mem")  is not None else TRACK),
+            (12, lambda e: _gauge_col(e["disk"]) if e.get("disk") is not None else TRACK),
+        ]
         for r in self.results:
             hist = self.history.get(r.url or r.name, [])
             if not hist:
                 continue
-            pm = QPixmap(317, 5)
+            pm = QPixmap(317, 14)
             pm.fill(Qt.GlobalColor.transparent)
             pp = QPainter(pm)
             n = len(hist)
             bw = 317 / n
-            for i, e in enumerate(hist):
-                x = i * bw
-                pp.fillRect(QRectF(x, 0, max(1, bw), 2), GREEN if e["host_ok"] else RED)
-                pp.fillRect(QRectF(x, 3, max(1, bw), 2), GREEN if e["page_ok"] else RED)
+            for bar_y, col_fn in BARS:
+                for i, e in enumerate(hist):
+                    pp.fillRect(QRectF(i * bw, bar_y, max(1, bw), 2), col_fn(e))
             pp.end()
             self._hist_pixmaps[r.url or r.name] = pm
 
@@ -430,11 +438,11 @@ class Panel(QWidget):
             if i % 2 == 0:
                 p.fillRect(QRectF(0, top, 320, ROW_H), PANEL)
 
-            cy = top + ROW_H / 2
+            cy = top + (ROW_H - 14) / 2
             self._light(p, 13, cy, r.host_ok)
             self._light(p, 32, cy, r.page_ok)
 
-            name_y = top + (ROW_H - 35) / 2
+            name_y = top + (ROW_H - 14 - 35) / 2
             p.setPen(TEXT)
             p.setFont(QFont("DejaVu Sans", 12, QFont.Weight.Bold))
             p.drawText(QRectF(46, name_y, 140, 22), Qt.AlignmentFlag.AlignVCenter, r.name)
@@ -456,7 +464,7 @@ class Panel(QWidget):
             # history bars — pre-rendered pixmap, one drawPixmap per card
             pm = self._hist_pixmaps.get(r.url or r.name)
             if pm:
-                p.drawPixmap(0, int(top + ROW_H - 6), pm)
+                p.drawPixmap(0, int(top + ROW_H - 15), pm)
 
         p.setClipping(False)
 
