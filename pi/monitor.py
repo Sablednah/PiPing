@@ -106,6 +106,7 @@ class SiteResult:
     disk: dict | None = None
     error: str = ""
     has_agent: bool = False
+    skip_disk: bool = False
 
 
 def _status_priority(r: SiteResult) -> int:
@@ -168,7 +169,8 @@ class Poller(QThread):
         token  = self.config.get("agent_token", "")
         tout   = self.config.get("http_timeout_seconds", 10)
 
-        r = SiteResult(name=name, url=url, grep_phrase=grep, has_agent=bool(agent))
+        r = SiteResult(name=name, url=url, grep_phrase=grep, has_agent=bool(agent),
+                       skip_disk=bool(site.get("skip_disk", False)))
 
         # --- outsider HTTP check (what a visitor sees) ---
         if url:
@@ -315,12 +317,15 @@ class Panel(QWidget):
             hist = self.history.get(r.url or r.name, [])
             if not hist:
                 continue
+            bars = BARS[:]
+            if r.skip_disk:
+                bars[4] = (12, lambda e: TRACK)
             pm = QPixmap(317, 14)
             pm.fill(Qt.GlobalColor.transparent)
             pp = QPainter(pm)
             n = len(hist)
             bw = 317 / n
-            for bar_y, col_fn in BARS:
+            for bar_y, col_fn in bars:
                 for i, e in enumerate(hist):
                     pp.fillRect(QRectF(i * bw, bar_y, max(1, bw), 2), col_fn(e))
             pp.end()
@@ -454,7 +459,9 @@ class Panel(QWidget):
             if r.cpu or r.memory or r.disk:
                 self._arc(p, 210, cy, r.cpu.get("percent") if r.cpu else None, "CPU")
                 self._arc(p, 254, cy, r.memory.get("percent") if r.memory else None, "MEM")
-                self._arc(p, 298, cy, r.disk.get("percent") if r.disk else None, "DSK")
+                self._arc(p, 298, cy,
+                          None if r.skip_disk else (r.disk.get("percent") if r.disk else None),
+                          "DSK", na_text="NA" if r.skip_disk else "—")
             else:
                 p.setPen(MUTED)
                 p.setFont(QFont("DejaVu Sans", 7))
@@ -553,7 +560,7 @@ class Panel(QWidget):
             if mem_vals:
                 self._sparkline(p, y, 20, mem_vals, "MEM")
                 y += 23
-            if disk_vals:
+            if disk_vals and not r.skip_disk:
                 self._sparkline(p, y, 20, disk_vals, "DSK")
                 y += 23
 
@@ -574,9 +581,15 @@ class Panel(QWidget):
             if r.memory:
                 m = r.memory
                 stat_line("Memory", f"{m.get('percent')}%  ({m.get('used_mb')} / {m.get('total_mb')} MB)")
-            if r.disk:
+            if r.disk and not r.skip_disk:
                 d = r.disk
                 stat_line("Disk", f"{d.get('percent')}%  ({d.get('used_gb')} / {d.get('total_gb')} GB)")
+            elif r.skip_disk:
+                p.setPen(MUTED)
+                p.drawText(QRectF(12, y, 295, 18), Qt.AlignmentFlag.AlignVCenter, "Disk")
+                p.setPen(MUTED)
+                p.drawText(QRectF(84, y, 221, 18), Qt.AlignmentFlag.AlignVCenter, "N/A (unlimited hosting)")
+                y += 20
         elif not r.has_agent:
             sep()
             p.setPen(MUTED)
@@ -667,7 +680,7 @@ class Panel(QWidget):
         p.setBrush(QBrush(col)); p.setPen(Qt.PenStyle.NoPen)
         p.drawEllipse(QPointF(cx, cy), 7, 7)
 
-    def _arc(self, p, cx, cy, percent, label):
+    def _arc(self, p, cx, cy, percent, label, na_text="—"):
         R = 16
         rect = QRectF(cx - R, cy - R, R * 2, R * 2)
         p.setPen(QPen(TRACK, 4)); p.drawArc(rect, 0, 360 * 16)
@@ -683,7 +696,7 @@ class Panel(QWidget):
             p.setPen(MUTED); p.setFont(QFont("DejaVu Sans", 5))
             p.drawText(QRectF(cx - R, cy - 9, R * 2, 10), Qt.AlignmentFlag.AlignCenter, label)
             p.setPen(MUTED); p.setFont(QFont("DejaVu Sans", 7))
-            p.drawText(QRectF(cx - R, cy - 1, R * 2, 12), Qt.AlignmentFlag.AlignCenter, "—")
+            p.drawText(QRectF(cx - R, cy - 1, R * 2, 12), Qt.AlignmentFlag.AlignCenter, na_text)
 
     def closeEvent(self, ev):
         self.poller.stop()

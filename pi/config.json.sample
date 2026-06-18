@@ -11,7 +11,8 @@
       "name": "My Site",
       "url": "https://example.com/",
       "agent": "https://example.com/_status/status.php",
-      "grep": "Expected phrase on the page"
+      "grep": "Expected phrase on the page",
+      "skip_disk": false
     },
     {
       "name": "Another Site",
