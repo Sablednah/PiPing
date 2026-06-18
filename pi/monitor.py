@@ -190,13 +190,16 @@ class ThumbnailFetcher(QThread):
                 "https://shot.screenshotapi.net/screenshot"
                 f"?token={self.api_token}"
                 f"&url={urllib.parse.quote(self.site_url, safe='')}"
-                "&output=image&width=1280&height=800&fresh=false"
+                "&output=image&file_type=png"
             )
+            print(f"[thumb] fetching {self.site_url}", flush=True)
             req = urllib.request.Request(api_url, headers={"User-Agent": "PiStatusPanel/1.0"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=45) as resp:
                 data = resp.read()
+            print(f"[thumb] {len(data)} bytes, content-type={resp.headers.get('Content-Type')} for {self.site_url}", flush=True)
             self.ready.emit(self.site_url, data)
-        except Exception:
+        except Exception as e:
+            print(f"[thumb] failed for {self.site_url}: {e}", flush=True)
             self.ready.emit(self.site_url, b"")
 
 
@@ -218,6 +221,7 @@ class Panel(QWidget):
         self._is_dragging = False
 
         self._thumb_cache: dict[str, bytes] = {}
+        self._thumb_failed: set[str] = set()
         self._fetching: set[str] = set()
         self._fetchers: list = []
 
@@ -234,6 +238,7 @@ class Panel(QWidget):
         token = self.config.get("screenshot_api_token", "")
         if not token or not url or url in self._thumb_cache or url in self._fetching:
             return
+        self._thumb_failed.discard(url)
         self._fetching.add(url)
         f = ThumbnailFetcher(url, token)
         f.ready.connect(self._on_thumbnail)
@@ -242,8 +247,11 @@ class Panel(QWidget):
 
     def _on_thumbnail(self, url: str, data: bytes):
         self._fetching.discard(url)
-        self._thumb_cache[url] = data
         self._fetchers = [f for f in self._fetchers if f.isRunning()]
+        if data:
+            self._thumb_cache[url] = data
+        else:
+            self._thumb_failed.add(url)
         if self.detail_index is not None:
             self.update()
 
@@ -262,6 +270,7 @@ class Panel(QWidget):
         for r in self.results:
             if _status_priority(r) < 2:
                 self._thumb_cache.pop(r.url, None)
+                self._thumb_failed.discard(r.url)
         if detail_name is not None:
             for i, r in enumerate(self.results):
                 if r.name == detail_name:
@@ -451,6 +460,11 @@ class Panel(QWidget):
                 p.setFont(QFont("DejaVu Sans", 8))
                 p.drawText(QRectF(0, thumb_top, 320, 20), Qt.AlignmentFlag.AlignCenter,
                            "Loading preview…")
+            elif r.url in self._thumb_failed and avail > 20:
+                p.setPen(MUTED)
+                p.setFont(QFont("DejaVu Sans", 8))
+                p.drawText(QRectF(0, thumb_top, 320, 20), Qt.AlignmentFlag.AlignCenter,
+                           "Preview unavailable")
 
         # back hint
         p.setPen(MUTED); p.setFont(QFont("DejaVu Sans", 8))
