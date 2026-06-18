@@ -9,8 +9,8 @@ linuxfb platform plugin. Launch with:
 
 Two views:
   - Grid: one row per site. Two lights (host / page) + CPU·MEM·DISK arcs.
-  - Detail: tap a row to see HTTP status, response time, title, grep result,
-            and raw server stats. Tap anywhere to go back.
+  - Detail: tap a row to see status, history graphs, and a screenshot preview.
+            Swipe to scroll, tap to go back.
 
 Design notes for this panel:
   - 480x320, slow SPI refresh -> dark background, few colours, large targets.
@@ -33,7 +33,9 @@ from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QRectF, QPointF
 from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QBrush, QPixmap
 from PyQt6.QtWidgets import QApplication, QWidget
 
-CONFIG_PATH = Path(__file__).with_name("config.json")
+CONFIG_PATH  = Path(__file__).with_name("config.json")
+HISTORY_PATH = Path(__file__).with_name("history.json")
+HISTORY_MAX  = 30   # data points kept per site
 
 # ---- palette (kept tiny: dark bg is cheap to repaint on SPI) -------------
 BG       = QColor("#11141a")
@@ -46,6 +48,42 @@ RED      = QColor("#e1543f")
 TRACK    = QColor("#2b3140")
 
 ROW_H = 72   # fixed row height — enables scrolling regardless of site count
+
+
+# ---------------------------------------------------------------------------
+# History helpers (module-level, main-thread only via Qt signal delivery)
+# ---------------------------------------------------------------------------
+def load_history() -> dict:
+    if HISTORY_PATH.exists():
+        try:
+            return json.loads(HISTORY_PATH.read_text())
+        except Exception:
+            return {}
+    return {}
+
+def save_history(history: dict):
+    try:
+        HISTORY_PATH.write_text(json.dumps(history))
+    except Exception:
+        pass
+
+def append_history(history: dict, results: list):
+    t = int(time.time())
+    for r in results:
+        key = r.url or r.name
+        entry = {
+            "t": t,
+            "host_ok": r.host_ok, "page_ok": r.page_ok,
+            "http": r.http_status, "ms": r.response_ms, "grep": r.grep_found,
+            "cpu":  r.cpu.get("percent")  if r.cpu    else None,
+            "mem":  r.memory.get("percent") if r.memory else None,
+            "disk": r.disk.get("percent")  if r.disk   else None,
+        }
+        bucket = history.setdefault(key, [])
+        bucket.append(entry)
+        if len(bucket) > HISTORY_MAX:
+            del bucket[:-HISTORY_MAX]
+    save_history(history)
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +119,10 @@ def _status_priority(r: SiteResult) -> int:
     if worst >= 70:
         return 1
     return 2
+
+
+def _gauge_col(pct):
+    return GREEN if pct < 70 else (AMBER if pct < 90 else RED)
 
 
 # ---------------------------------------------------------------------------
@@ -135,17 +177,14 @@ class Poller(QThread):
                     r.http_status = resp.status
                     r.response_ms = int((time.time() - start) * 1000)
                     r.host_ok = True
-                    # title
                     m = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S)
                     if m:
                         r.title = re.sub(r"\s+", " ", m.group(1)).strip()[:80]
-                    # grep
                     if grep:
                         r.grep_found = grep in body
-                    # page_ok = 200 and (grep matched, or no grep configured)
                     r.page_ok = (resp.status == 200) and (r.grep_found is not False)
             except urllib.error.HTTPError as e:
-                r.host_ok = True               # server answered, just not 200
+                r.host_ok = True
                 r.http_status = e.code
                 r.error = f"HTTP {e.code}"
             except Exception as e:
@@ -166,7 +205,6 @@ class Poller(QThread):
                     r.memory = data.get("memory")
                     r.disk   = data.get("disk")
             except Exception as e:
-                # agent failure doesn't change host/page lights, just no gauges
                 if not r.error:
                     r.error = f"agent:{type(e).__name__}"
 
@@ -196,7 +234,7 @@ class ThumbnailFetcher(QThread):
             req = urllib.request.Request(api_url, headers={"User-Agent": "PiStatusPanel/1.0"})
             with urllib.request.urlopen(req, timeout=45) as resp:
                 data = resp.read()
-            print(f"[thumb] {len(data)} bytes, content-type={resp.headers.get('Content-Type')} for {self.site_url}", flush=True)
+            print(f"[thumb] {len(data)} bytes for {self.site_url}", flush=True)
             self.ready.emit(self.site_url, data)
         except Exception as e:
             print(f"[thumb] failed for {self.site_url}: {e}", flush=True)
@@ -216,6 +254,8 @@ class Panel(QWidget):
         self.setFixedSize(480, 320)
 
         self.scroll_offset = 0
+        self.detail_scroll = 0
+        self._detail_content_h = 480
         self._drag_start_y = 0.0
         self._drag_start_scroll = 0
         self._is_dragging = False
@@ -225,11 +265,12 @@ class Panel(QWidget):
         self._fetching: set[str] = set()
         self._fetchers: list = []
 
+        self.history = load_history()
+
         self.poller = Poller(config)
         self.poller.updated.connect(self.on_update)
         self.poller.start()
 
-        # clock tick so the "updated Ns ago" stays live
         self.clock = QTimer(self)
         self.clock.timeout.connect(self.update)
         self.clock.start(1000)
@@ -256,17 +297,14 @@ class Panel(QWidget):
             self.update()
 
     def on_update(self, results):
-        # Remember which site is open in detail view (by name) so we can
-        # keep detail_index correct after the sort reorders the list.
+        append_history(self.history, results)
         detail_name = (
             self.results[self.detail_index].name
             if self.detail_index is not None and self.detail_index < len(self.results)
             else None
         )
-        # Sort: red → amber → green, stable within each group (preserves config order).
         self.results = [r for _, r in sorted(enumerate(results),
                                              key=lambda x: (_status_priority(x[1]), x[0]))]
-        # drop cached screenshots for non-green sites so the next detail-tap fetches a fresh one
         for r in self.results:
             if _status_priority(r) < 2:
                 self._thumb_cache.pop(r.url, None)
@@ -281,43 +319,48 @@ class Panel(QWidget):
 
     # ---- input ----------------------------------------------------------
     def _touch_y(self, ev):
-        # Touch Y axis tracks physical left-right; scale [0,320) → portrait [0,480).
         return ev.position().y() * (480.0 / 320.0)
 
     def mousePressEvent(self, ev):
         y = self._touch_y(ev)
-        if self.detail_index is not None:
-            self.detail_index = None   # any press exits detail
-            self.update()
-            return
         self._drag_start_y = y
-        self._drag_start_scroll = self.scroll_offset
+        self._drag_start_scroll = (
+            self.detail_scroll if self.detail_index is not None else self.scroll_offset
+        )
         self._is_dragging = False
 
     def mouseMoveEvent(self, ev):
-        if self.detail_index is not None:
-            return
         y = self._touch_y(ev)
         delta = self._drag_start_y - y
         if not self._is_dragging and abs(delta) > 6:
             self._is_dragging = True
         if self._is_dragging:
-            max_scroll = max(0, len(self.results) * ROW_H - (480 - 40))
-            self.scroll_offset = max(0, min(self._drag_start_scroll + int(delta), max_scroll))
+            if self.detail_index is not None:
+                max_scroll = max(0, self._detail_content_h - 420)
+                self.detail_scroll = max(0, min(self._drag_start_scroll + int(delta), max_scroll))
+            else:
+                max_scroll = max(0, len(self.results) * ROW_H - 440)
+                self.scroll_offset = max(0, min(self._drag_start_scroll + int(delta), max_scroll))
             self.update()
 
     def mouseReleaseEvent(self, ev):
-        if self.detail_index is not None or self._is_dragging:
+        if self._is_dragging:
+            self._is_dragging = False
             return
         y = self._touch_y(ev)
+        if self.detail_index is not None:
+            self.detail_index = None
+            self.detail_scroll = 0
+            self.update()
+            return
         if y < 40:
-            # header tap → force immediate repoll
             self.poller.force_poll()
             return
         if self.results:
             idx = int((y + self.scroll_offset - 40) / ROW_H)
             if 0 <= idx < len(self.results):
                 self.detail_index = idx
+                self.detail_scroll = 0
                 self._fetch_thumbnail(self.results[idx].url)
                 self.update()
 
@@ -326,7 +369,6 @@ class Panel(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.fillRect(self.rect(), BG)
-        # Rotate content 90° CW so 320×480 portrait fills the 480×320 landscape framebuffer.
         p.translate(480, 0)
         p.rotate(90)
         if self.detail_index is not None and self.detail_index < len(self.results):
@@ -337,10 +379,8 @@ class Panel(QWidget):
 
     def _header(self, p, title):
         p.setPen(TEXT)
-        f = QFont("DejaVu Sans", 13, QFont.Weight.Bold)
-        p.setFont(f)
+        p.setFont(QFont("DejaVu Sans", 13, QFont.Weight.Bold))
         p.drawText(QRectF(10, 6, 210, 28), Qt.AlignmentFlag.AlignVCenter, title)
-        # freshness
         ago = int(time.time() - self.last_update) if self.last_update else -1
         p.setPen(MUTED)
         p.setFont(QFont("DejaVu Sans", 8))
@@ -368,12 +408,9 @@ class Panel(QWidget):
                 p.fillRect(QRectF(0, top, 320, ROW_H), PANEL)
 
             cy = top + ROW_H / 2
-
-            # lights - side by side, vertically centred
             self._light(p, 13, cy, r.host_ok)
             self._light(p, 32, cy, r.page_ok)
 
-            # name + title as a compact centred block
             name_y = top + (ROW_H - 35) / 2
             p.setPen(TEXT)
             p.setFont(QFont("DejaVu Sans", 12, QFont.Weight.Bold))
@@ -383,7 +420,6 @@ class Panel(QWidget):
                 p.setFont(QFont("DejaVu Sans", 7))
                 p.drawText(QRectF(46, name_y + 23, 140, 12), Qt.AlignmentFlag.AlignVCenter, r.title)
 
-            # gauges - right side, vertically centred
             if r.cpu or r.memory or r.disk:
                 self._arc(p, 210, cy, r.cpu.get("percent") if r.cpu else None, "CPU")
                 self._arc(p, 254, cy, r.memory.get("percent") if r.memory else None, "MEM")
@@ -392,12 +428,10 @@ class Panel(QWidget):
                 p.setPen(MUTED)
                 p.setFont(QFont("DejaVu Sans", 7))
                 tag = "HTTP only" if not r.has_agent else (r.error or "no data")
-                p.drawText(QRectF(185, top, 130, ROW_H),
-                           Qt.AlignmentFlag.AlignCenter, tag)
+                p.drawText(QRectF(185, top, 130, ROW_H), Qt.AlignmentFlag.AlignCenter, tag)
 
         p.setClipping(False)
 
-        # scrollbar
         total_h = len(self.results) * ROW_H
         if total_h > 440:
             thumb_h = max(24, int(440 * 440 / total_h))
@@ -407,70 +441,164 @@ class Panel(QWidget):
 
     def paint_detail(self, p, r: SiteResult):
         self._header(p, r.name)
-        p.setFont(QFont("DejaVu Sans Mono", 9))
+
+        # fixed footer (outside scroll clip)
+        p.setPen(MUTED)
+        p.setFont(QFont("DejaVu Sans", 8))
+        p.drawText(QRectF(0, 460, 317, 18), Qt.AlignmentFlag.AlignCenter, "tap to go back")
+
+        # scrollable content
+        p.save()
+        p.setClipRect(QRectF(0, 40, 317, 420))
+        p.translate(0, -self.detail_scroll)
+
         y = 50
-        def line(label, value, colour=TEXT):
+
+        def sep():
             nonlocal y
-            p.setPen(MUTED); p.drawText(QRectF(12, y, 100, 20), Qt.AlignmentFlag.AlignVCenter, label)
-            p.setPen(colour); p.drawText(QRectF(115, y, 193, 20), Qt.AlignmentFlag.AlignVCenter, value)
-            y += 22
+            y += 4
+            p.setPen(QPen(TRACK, 1))
+            p.drawLine(12, y, 308, y)
+            y += 6
 
-        line("HTTP", str(r.http_status or "—"),
-             GREEN if r.http_status == 200 else (RED if r.http_status else MUTED))
-        line("Response", f"{r.response_ms} ms" if r.response_ms else "—")
-        line("Title", r.title or "—")
+        # ---- compact status line: HTTP code | response time | grep ----
+        p.setFont(QFont("DejaVu Sans Mono", 9))
+        http_col = GREEN if r.http_status == 200 else (RED if r.http_status else MUTED)
+        p.setPen(MUTED)
+        p.drawText(QRectF(12, y, 36, 20), Qt.AlignmentFlag.AlignVCenter, "HTTP")
+        p.setPen(http_col)
+        p.drawText(QRectF(50, y, 38, 20), Qt.AlignmentFlag.AlignVCenter,
+                   str(r.http_status or "—"))
+        p.setPen(MUTED)
+        p.drawText(QRectF(90, y, 60, 20), Qt.AlignmentFlag.AlignVCenter,
+                   f"{r.response_ms}ms" if r.response_ms else "—")
         if r.grep_phrase:
-            line("Phrase", "found" if r.grep_found else "MISSING",
-                 GREEN if r.grep_found else RED)
-        else:
-            line("Phrase", "(none set)", MUTED)
+            p.setPen(MUTED)
+            p.drawText(QRectF(155, y, 28, 20), Qt.AlignmentFlag.AlignVCenter, "grep")
+            p.setPen(GREEN if r.grep_found else RED)
+            p.drawText(QRectF(185, y, 14, 20), Qt.AlignmentFlag.AlignVCenter,
+                       "✓" if r.grep_found else "✗")
+        y += 24
+
+        # ---- title ----
+        if r.title:
+            p.setPen(MUTED)
+            p.setFont(QFont("DejaVu Sans", 8))
+            p.drawText(QRectF(12, y, 295, 18), Qt.AlignmentFlag.AlignVCenter, r.title)
+            y += 20
+
+        # ---- error ----
         if r.error:
-            line("Error", r.error, RED)
+            p.setPen(RED)
+            p.setFont(QFont("DejaVu Sans", 8))
+            p.drawText(QRectF(12, y, 295, 18), Qt.AlignmentFlag.AlignVCenter, r.error)
+            y += 20
 
-        # server stats block
-        y += 6
-        p.setPen(QPen(TRACK, 1)); p.drawLine(12, y, 308, y); y += 8
-        if r.cpu:
-            c = r.cpu
-            line("CPU", f"{c.get('percent')}%  load {c.get('load1')} / {c.get('cores')} cores")
-        if r.memory:
-            m = r.memory
-            line("Memory", f"{m.get('percent')}%  ({m.get('used_mb')}/{m.get('total_mb')} MB)")
-        if r.disk:
-            d = r.disk
-            line("Disk", f"{d.get('percent')}%  ({d.get('used_gb')}/{d.get('total_gb')} GB)")
-        if not (r.cpu or r.memory or r.disk):
-            line("Server", "HTTP-only site (no agent)", MUTED)
+        # ---- history dots ----
+        hist = self.history.get(r.url or r.name, [])
+        if hist:
+            sep()
+            host_cols = [GREEN if e["host_ok"] else RED for e in hist]
+            page_cols = [GREEN if e["page_ok"] else RED for e in hist]
+            self._history_dots(p, y, 14, host_cols, "host")
+            y += 16
+            self._history_dots(p, y, 14, page_cols, "page")
+            y += 16
 
-        # thumbnail preview (loaded once on first open, cached thereafter)
+        # ---- sparklines ----
+        if r.has_agent and hist:
+            sep()
+            cpu_vals  = [(e["cpu"],  _gauge_col(e["cpu"]))  for e in hist if e.get("cpu")  is not None]
+            mem_vals  = [(e["mem"],  _gauge_col(e["mem"]))  for e in hist if e.get("mem")  is not None]
+            disk_vals = [(e["disk"], _gauge_col(e["disk"])) for e in hist if e.get("disk") is not None]
+            if cpu_vals:
+                self._sparkline(p, y, 20, cpu_vals, "CPU")
+                y += 23
+            if mem_vals:
+                self._sparkline(p, y, 20, mem_vals, "MEM")
+                y += 23
+            if disk_vals:
+                self._sparkline(p, y, 20, disk_vals, "DSK")
+                y += 23
+
+        # ---- thumbnail ----
         if self.config.get("screenshot_api_token") and r.url:
-            thumb_top = y + 12
-            avail = 448 - thumb_top
+            sep()
             if r.url in self._thumb_cache and self._thumb_cache[r.url]:
                 pm = QPixmap()
-                if pm.loadFromData(self._thumb_cache[r.url]) and not pm.isNull() and avail > 30:
-                    tw, th = 300, int(pm.height() * 300 / pm.width())
-                    if th > avail:
-                        tw, th = int(pm.width() * avail / pm.height()), avail
+                if pm.loadFromData(self._thumb_cache[r.url]) and not pm.isNull():
+                    tw, th = 295, int(pm.height() * 295 / pm.width())
                     scaled = pm.scaled(tw, th, Qt.AspectRatioMode.KeepAspectRatio,
                                        Qt.TransformationMode.SmoothTransformation)
-                    p.drawPixmap((320 - scaled.width()) // 2, thumb_top, scaled)
-            elif r.url in self._fetching and avail > 20:
-                p.setPen(MUTED)
-                p.setFont(QFont("DejaVu Sans", 8))
-                p.drawText(QRectF(0, thumb_top, 320, 20), Qt.AlignmentFlag.AlignCenter,
+                    p.drawPixmap(12, y, scaled)
+                    y += th + 4
+                else:
+                    p.setPen(MUTED); p.setFont(QFont("DejaVu Sans", 8))
+                    p.drawText(QRectF(0, y, 317, 20), Qt.AlignmentFlag.AlignCenter,
+                               "Preview unavailable")
+                    y += 22
+            elif r.url in self._fetching:
+                p.setPen(MUTED); p.setFont(QFont("DejaVu Sans", 8))
+                p.drawText(QRectF(0, y, 317, 20), Qt.AlignmentFlag.AlignCenter,
                            "Loading preview…")
-            elif r.url in self._thumb_failed and avail > 20:
-                p.setPen(MUTED)
-                p.setFont(QFont("DejaVu Sans", 8))
-                p.drawText(QRectF(0, thumb_top, 320, 20), Qt.AlignmentFlag.AlignCenter,
+                y += 22
+            elif r.url in self._thumb_failed:
+                p.setPen(MUTED); p.setFont(QFont("DejaVu Sans", 8))
+                p.drawText(QRectF(0, y, 317, 20), Qt.AlignmentFlag.AlignCenter,
                            "Preview unavailable")
+                y += 22
 
-        # back hint
-        p.setPen(MUTED); p.setFont(QFont("DejaVu Sans", 8))
-        p.drawText(QRectF(0, 460, 320, 18), Qt.AlignmentFlag.AlignCenter, "tap to go back")
+        y += 8
+        self._detail_content_h = y - 50
 
-    # ---- primitives -----------------------------------------------------
+        p.restore()
+        p.setClipping(False)
+
+        # scrollbar
+        if self._detail_content_h > 420:
+            thumb_h = max(24, int(420 * 420 / self._detail_content_h))
+            thumb_y = 40 + int(self.detail_scroll * (420 - thumb_h) /
+                                max(1, self._detail_content_h - 420))
+            p.fillRect(QRectF(317, 40, 3, 420), TRACK)
+            p.fillRect(QRectF(317, thumb_y, 3, thumb_h), MUTED)
+
+    # ---- drawing helpers ------------------------------------------------
+    def _history_dots(self, p, y, h, values, label):
+        LABEL_W = 28
+        DOT_R   = 3
+        STEP    = 8
+        p.setPen(MUTED)
+        p.setFont(QFont("DejaVu Sans", 6))
+        p.drawText(QRectF(12, y, LABEL_W, h), Qt.AlignmentFlag.AlignVCenter, label)
+        cx = 12 + LABEL_W + DOT_R
+        cy = y + h / 2
+        p.setPen(Qt.PenStyle.NoPen)
+        for col in values:
+            p.setBrush(QBrush(col))
+            p.drawEllipse(QPointF(cx, cy), DOT_R, DOT_R)
+            cx += STEP
+
+    def _sparkline(self, p, y, h, values, label):
+        LABEL_W = 28
+        VAL_W   = 28
+        BAR_X   = 12 + LABEL_W
+        BAR_W   = 295 - LABEL_W - VAL_W
+        p.setPen(MUTED)
+        p.setFont(QFont("DejaVu Sans", 6))
+        p.drawText(QRectF(12, y, LABEL_W, h), Qt.AlignmentFlag.AlignVCenter, label)
+        p.fillRect(QRectF(BAR_X, y + 2, BAR_W, h - 4), TRACK)
+        n = len(values)
+        if n:
+            bw = BAR_W / n
+            for i, (pct, col) in enumerate(values):
+                bh = max(1, int((h - 4) * pct / 100))
+                p.fillRect(QRectF(BAR_X + i * bw, y + h - 2 - bh, max(1, bw - 1), bh), col)
+            last_pct, last_col = values[-1]
+            p.setPen(last_col)
+            p.setFont(QFont("DejaVu Sans", 7, QFont.Weight.Bold))
+            p.drawText(QRectF(BAR_X + BAR_W + 2, y, VAL_W, h),
+                       Qt.AlignmentFlag.AlignVCenter, f"{last_pct}%")
+
     def _light(self, p, cx, cy, ok):
         col = GREEN if ok else RED
         p.setBrush(QBrush(col)); p.setPen(Qt.PenStyle.NoPen)
@@ -484,7 +612,6 @@ class Panel(QWidget):
             col = GREEN if percent < 70 else (AMBER if percent < 90 else RED)
             p.setPen(QPen(col, 4))
             p.drawArc(rect, 90 * 16, int(-360 * 16 * percent / 100))
-            # label + number both inside the arc
             p.setPen(MUTED); p.setFont(QFont("DejaVu Sans", 5))
             p.drawText(QRectF(cx - R, cy - 9, R * 2, 10), Qt.AlignmentFlag.AlignCenter, label)
             p.setPen(TEXT); p.setFont(QFont("DejaVu Sans", 8, QFont.Weight.Bold))
@@ -508,7 +635,7 @@ def main():
     config = json.loads(CONFIG_PATH.read_text())
 
     app = QApplication(sys.argv)
-    app.setOverrideCursor(Qt.CursorShape.BlankCursor)   # no mouse pointer on kiosk
+    app.setOverrideCursor(Qt.CursorShape.BlankCursor)
     w = Panel(config)
     w.show()
     sys.exit(app.exec())

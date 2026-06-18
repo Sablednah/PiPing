@@ -1,6 +1,7 @@
 panel.png
 layout_idea.png
 pi/config.json
+pi/history.json
 files.zip
 __pycache__/
 *.pyc
