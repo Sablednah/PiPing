@@ -2,7 +2,7 @@
 
 A site-monitoring kiosk for a Raspberry Pi 3B+ with a 3.5" SPI touchscreen. Displays a scrollable grid of monitored websites — status lights, response checks, grep phrase validation, and live server gauges (CPU / memory / disk) from an optional PHP agent on each host.
 
-![PiPing panel](layout_idea.png)
+![PiPing panel](screenshot.png)
 
 ---
 
