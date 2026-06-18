@@ -266,6 +266,7 @@ class Panel(QWidget):
         self._fetchers: list = []
 
         self.history = load_history()
+        self._hist_pixmaps: dict[str, QPixmap] = {}
 
         self.poller = Poller(config)
         self.poller.updated.connect(self.on_update)
@@ -273,7 +274,7 @@ class Panel(QWidget):
 
         self.clock = QTimer(self)
         self.clock.timeout.connect(self.update)
-        self.clock.start(1000)
+        self.clock.start(5000)
 
     def _fetch_thumbnail(self, url: str):
         token = self.config.get("screenshot_api_token", "")
@@ -296,6 +297,24 @@ class Panel(QWidget):
         if self.detail_index is not None:
             self.update()
 
+    def _rebuild_hist_pixmaps(self):
+        self._hist_pixmaps.clear()
+        for r in self.results:
+            hist = self.history.get(r.url or r.name, [])
+            if not hist:
+                continue
+            pm = QPixmap(317, 5)
+            pm.fill(Qt.GlobalColor.transparent)
+            pp = QPainter(pm)
+            n = len(hist)
+            bw = 317 / n
+            for i, e in enumerate(hist):
+                x = i * bw
+                pp.fillRect(QRectF(x, 0, max(1, bw), 2), GREEN if e["host_ok"] else RED)
+                pp.fillRect(QRectF(x, 3, max(1, bw), 2), GREEN if e["page_ok"] else RED)
+            pp.end()
+            self._hist_pixmaps[r.url or r.name] = pm
+
     def on_update(self, results):
         append_history(self.history, results)
         detail_name = (
@@ -314,6 +333,7 @@ class Panel(QWidget):
                 if r.name == detail_name:
                     self.detail_index = i
                     break
+        self._rebuild_hist_pixmaps()
         self.last_update = time.time()
         self.update()
 
@@ -430,17 +450,10 @@ class Panel(QWidget):
                 tag = "HTTP only" if not r.has_agent else (r.error or "no data")
                 p.drawText(QRectF(185, top, 130, ROW_H), Qt.AlignmentFlag.AlignCenter, tag)
 
-            # history bars — two 2px lines at bottom of card
-            hist = self.history.get(r.url or r.name, [])
-            if hist:
-                n = len(hist)
-                bw = 317 / n
-                for i, e in enumerate(hist):
-                    x = i * bw
-                    p.fillRect(QRectF(x, top + ROW_H - 6, max(1, bw), 2),
-                               GREEN if e["host_ok"] else RED)
-                    p.fillRect(QRectF(x, top + ROW_H - 3, max(1, bw), 2),
-                               GREEN if e["page_ok"] else RED)
+            # history bars — pre-rendered pixmap, one drawPixmap per card
+            pm = self._hist_pixmaps.get(r.url or r.name)
+            if pm:
+                p.drawPixmap(0, int(top + ROW_H - 6), pm)
 
         p.setClipping(False)
 
