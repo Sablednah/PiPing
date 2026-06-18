@@ -67,6 +67,20 @@ class SiteResult:
     has_agent: bool = False
 
 
+def _status_priority(r: SiteResult) -> int:
+    """Sort key: 0=red, 1=amber, 2=green. Dots + CPU/MEM only (disk excluded)."""
+    if not r.host_ok or not r.page_ok:
+        return 0
+    cpu_pct = r.cpu.get("percent") if r.cpu else 0
+    mem_pct = r.memory.get("percent") if r.memory else 0
+    worst = max(cpu_pct or 0, mem_pct or 0)
+    if worst >= 90:
+        return 0
+    if worst >= 70:
+        return 1
+    return 2
+
+
 # ---------------------------------------------------------------------------
 # Worker thread: does all network I/O, emits results back to the UI
 # ---------------------------------------------------------------------------
@@ -184,7 +198,21 @@ class Panel(QWidget):
         self.clock.start(1000)
 
     def on_update(self, results):
-        self.results = results
+        # Remember which site is open in detail view (by name) so we can
+        # keep detail_index correct after the sort reorders the list.
+        detail_name = (
+            self.results[self.detail_index].name
+            if self.detail_index is not None and self.detail_index < len(self.results)
+            else None
+        )
+        # Sort: red → amber → green, stable within each group (preserves config order).
+        self.results = [r for _, r in sorted(enumerate(results),
+                                             key=lambda x: (_status_priority(x[1]), x[0]))]
+        if detail_name is not None:
+            for i, r in enumerate(self.results):
+                if r.name == detail_name:
+                    self.detail_index = i
+                    break
         self.last_update = time.time()
         self.update()
 
