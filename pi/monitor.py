@@ -521,6 +521,34 @@ class Panel(QWidget):
                 self._sparkline(p, y, 20, disk_vals, "DSK")
                 y += 23
 
+        # ---- current server stats (numbers) ----
+        if r.cpu or r.memory or r.disk:
+            sep()
+            p.setFont(QFont("DejaVu Sans Mono", 8))
+            def stat_line(label, value):
+                nonlocal y
+                p.setPen(MUTED)
+                p.drawText(QRectF(12, y, 70, 18), Qt.AlignmentFlag.AlignVCenter, label)
+                p.setPen(TEXT)
+                p.drawText(QRectF(84, y, 221, 18), Qt.AlignmentFlag.AlignVCenter, value)
+                y += 20
+            if r.cpu:
+                c = r.cpu
+                stat_line("CPU", f"{c.get('percent')}%  load {c.get('load1')} / {c.get('cores')} cores")
+            if r.memory:
+                m = r.memory
+                stat_line("Memory", f"{m.get('percent')}%  ({m.get('used_mb')} / {m.get('total_mb')} MB)")
+            if r.disk:
+                d = r.disk
+                stat_line("Disk", f"{d.get('percent')}%  ({d.get('used_gb')} / {d.get('total_gb')} GB)")
+        elif not r.has_agent:
+            sep()
+            p.setPen(MUTED)
+            p.setFont(QFont("DejaVu Sans", 8))
+            p.drawText(QRectF(12, y, 295, 18), Qt.AlignmentFlag.AlignVCenter,
+                       "HTTP-only site — no agent installed")
+            y += 20
+
         # ---- thumbnail ----
         if self.config.get("screenshot_api_token") and r.url:
             sep()
