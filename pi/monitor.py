@@ -25,11 +25,12 @@ import re
 import threading
 import urllib.request
 import urllib.error
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QRectF, QPointF
-from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QBrush
+from PyQt6.QtGui import QPainter, QColor, QFont, QPen, QBrush, QPixmap
 from PyQt6.QtWidgets import QApplication, QWidget
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
@@ -53,6 +54,7 @@ ROW_H = 72   # fixed row height — enables scrolling regardless of site count
 @dataclass
 class SiteResult:
     name: str
+    url: str = ""
     host_ok: bool = False        # agent reachable OR url reachable at all
     page_ok: bool = False        # HTTP 200 AND grep matched (if grep set)
     http_status: int = 0
@@ -121,7 +123,7 @@ class Poller(QThread):
         token  = self.config.get("agent_token", "")
         tout   = self.config.get("http_timeout_seconds", 10)
 
-        r = SiteResult(name=name, grep_phrase=grep, has_agent=bool(agent))
+        r = SiteResult(name=name, url=url, grep_phrase=grep, has_agent=bool(agent))
 
         # --- outsider HTTP check (what a visitor sees) ---
         if url:
@@ -172,6 +174,33 @@ class Poller(QThread):
 
 
 # ---------------------------------------------------------------------------
+# Thumbnail fetcher: fires once per site URL on first detail-view open
+# ---------------------------------------------------------------------------
+class ThumbnailFetcher(QThread):
+    ready = pyqtSignal(str, bytes)   # site_url, raw image bytes (b"" = failed)
+
+    def __init__(self, site_url, api_token):
+        super().__init__()
+        self.site_url = site_url
+        self.api_token = api_token
+
+    def run(self):
+        try:
+            api_url = (
+                "https://shot.screenshotapi.net/screenshot"
+                f"?token={self.api_token}"
+                f"&url={urllib.parse.quote(self.site_url, safe='')}"
+                "&output=image&width=1280&height=800&fresh=false"
+            )
+            req = urllib.request.Request(api_url, headers={"User-Agent": "PiStatusPanel/1.0"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = resp.read()
+            self.ready.emit(self.site_url, data)
+        except Exception:
+            self.ready.emit(self.site_url, b"")
+
+
+# ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 class Panel(QWidget):
@@ -188,6 +217,10 @@ class Panel(QWidget):
         self._drag_start_scroll = 0
         self._is_dragging = False
 
+        self._thumb_cache: dict[str, bytes] = {}
+        self._fetching: set[str] = set()
+        self._fetchers: list = []
+
         self.poller = Poller(config)
         self.poller.updated.connect(self.on_update)
         self.poller.start()
@@ -196,6 +229,23 @@ class Panel(QWidget):
         self.clock = QTimer(self)
         self.clock.timeout.connect(self.update)
         self.clock.start(1000)
+
+    def _fetch_thumbnail(self, url: str):
+        token = self.config.get("screenshot_api_token", "")
+        if not token or not url or url in self._thumb_cache or url in self._fetching:
+            return
+        self._fetching.add(url)
+        f = ThumbnailFetcher(url, token)
+        f.ready.connect(self._on_thumbnail)
+        self._fetchers.append(f)
+        f.start()
+
+    def _on_thumbnail(self, url: str, data: bytes):
+        self._fetching.discard(url)
+        self._thumb_cache[url] = data
+        self._fetchers = [f for f in self._fetchers if f.isRunning()]
+        if self.detail_index is not None:
+            self.update()
 
     def on_update(self, results):
         # Remember which site is open in detail view (by name) so we can
@@ -255,6 +305,7 @@ class Panel(QWidget):
             idx = int((y + self.scroll_offset - 40) / ROW_H)
             if 0 <= idx < len(self.results):
                 self.detail_index = idx
+                self._fetch_thumbnail(self.results[idx].url)
                 self.update()
 
     # ---- painting -------------------------------------------------------
@@ -377,6 +428,25 @@ class Panel(QWidget):
             line("Disk", f"{d.get('percent')}%  ({d.get('used_gb')}/{d.get('total_gb')} GB)")
         if not (r.cpu or r.memory or r.disk):
             line("Server", "HTTP-only site (no agent)", MUTED)
+
+        # thumbnail preview (loaded once on first open, cached thereafter)
+        if self.config.get("screenshot_api_token") and r.url:
+            thumb_top = y + 12
+            avail = 448 - thumb_top
+            if r.url in self._thumb_cache and self._thumb_cache[r.url]:
+                pm = QPixmap()
+                if pm.loadFromData(self._thumb_cache[r.url]) and not pm.isNull() and avail > 30:
+                    tw, th = 300, int(pm.height() * 300 / pm.width())
+                    if th > avail:
+                        tw, th = int(pm.width() * avail / pm.height()), avail
+                    scaled = pm.scaled(tw, th, Qt.AspectRatioMode.KeepAspectRatio,
+                                       Qt.TransformationMode.SmoothTransformation)
+                    p.drawPixmap((320 - scaled.width()) // 2, thumb_top, scaled)
+            elif r.url in self._fetching and avail > 20:
+                p.setPen(MUTED)
+                p.setFont(QFont("DejaVu Sans", 8))
+                p.drawText(QRectF(0, thumb_top, 320, 20), Qt.AlignmentFlag.AlignCenter,
+                           "Loading preview…")
 
         # back hint
         p.setPen(MUTED); p.setFont(QFont("DejaVu Sans", 8))

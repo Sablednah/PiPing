@@ -4,6 +4,7 @@
   "poll_interval_seconds": 30,
   "http_timeout_seconds": 10,
   "agent_token": "CHANGE-ME-to-a-long-random-string",
+  "screenshot_api_token": "",
 
   "sites": [
     {
