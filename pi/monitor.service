@@ -1,0 +1,19 @@
+[Unit]
+Description=Pi Site Status Panel (framebuffer kiosk)
+After=multi-user.target
+
+[Service]
+Type=simple
+User=sable
+# Draw straight to the SPI panel framebuffer, no desktop.
+Environment=QT_QPA_PLATFORM=linuxfb:fb=/dev/fb1
+# ads7846 touch comes through as an evdev device; let Qt find it.
+Environment=QT_QPA_FB_TSLIB=0
+WorkingDirectory=/home/sable/pi-status-panel/pi
+ExecStartPre=+/bin/sh -c 'printf "\\033[?25l" > /dev/tty1 2>/dev/null || true'
+ExecStart=/usr/bin/python3 /home/sable/pi-status-panel/pi/monitor.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

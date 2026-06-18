@@ -1,0 +1,6 @@
+panel.png
+files.zip
+__pycache__/
+*.pyc
+.claude/
+agent/_status/
