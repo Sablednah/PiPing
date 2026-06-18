@@ -3,56 +3,26 @@
 
   "poll_interval_seconds": 30,
   "http_timeout_seconds": 10,
-  "agent_token": "thereisnosp00m",
+  "agent_token": "CHANGE-ME-to-a-long-random-string",
 
   "sites": [
     {
-      "name": "1on1 Wholesale",
-      "url": "https://1on1wholesale.co.uk/",
-      "agent": "https://1on1wholesale.co.uk/_status/status.php",
+      "name": "My Site",
+      "url": "https://example.com/",
+      "agent": "https://example.com/_status/status.php",
+      "grep": "Expected phrase on the page"
+    },
+    {
+      "name": "Another Site",
+      "url": "https://another-example.com/",
+      "agent": "https://another-example.com/_status/status.php",
       "grep": "Copyright 2026"
     },
     {
-      "name": "1on1 EU",
-      "url": "https://www.1on1wholesale.eu/",
-      "agent": "https://www.1on1wholesale.eu/_status/status.php",
-      "grep": "Copyright 2026"
-    },
-    {
-      "name": "Happy Lola",
-      "url": "https://happylola.com/",
-      "agent": "https://www.happylola.com/_status/status.php",
-      "grep": "Copyright 2026"
-    },
-    {
-      "name": "10K Used",
-      "url": "https://10kused.com/",
-      "agent": "https://10kused.com/_status/status.php",
-      "grep": "This is a trade website for B2B sales."
-    },
-    {
-      "name": "Clonezone",
-      "url": "https://clonezonedirect.co.uk/",
-      "agent": "https://clonezonedirect.co.uk/_status/status.php",
-      "grep": "Clonezone is the trading name of Libertybelle UK Ltd"
-    },
-    {
-      "name": "Cara Sutra",
-      "url": "https://carasutra.com/",
-      "agent": "https://carasutra.com/_status/status.php",
-      "grep": "Design SableCraft"
-    },
-    {
-      "name": "10K New",
-      "url": "https://www.10knew.com/",
+      "name": "HTTP Only",
+      "url": "https://http-only-example.com/",
       "agent": null,
-      "grep": "10Knew 2026"
-    },
-    {
-      "name": "Loving Joy",
-      "url": "https://www.lovingjoy.com/",
-      "agent": null,
-      "grep": "Copyright 2026"
+      "grep": "Some phrase to check for"
     }
   ]
 }
