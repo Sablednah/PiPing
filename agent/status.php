@@ -21,7 +21,7 @@
 // ---------------------------------------------------------------------------
 // Prefer an environment variable if your host lets you set one; otherwise
 // edit the fallback string. The script REFUSES TO RUN if left as the default.
-$EXPECTED_TOKEN = getenv('STATUS_TOKEN') ?: 'thereisnosp00m';
+$EXPECTED_TOKEN = getenv('STATUS_TOKEN') ?: 'CHANGE-ME-to-a-long-random-string';
 
 // Optional: the path whose disk usage you want to report. Default = this
 // script's own filesystem, which on shared hosting is your account's volume.
