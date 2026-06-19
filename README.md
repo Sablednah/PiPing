@@ -4,6 +4,8 @@ A site-monitoring kiosk for a Raspberry Pi 3B+ with a 3.5" SPI touchscreen. Disp
 
 Also serves a **web panel** on port 8080 so you can check status from any browser, with the same dark-theme grid, history sparklines, and screenshot thumbnails.
 
+Push notifications via [Pushover](https://pushover.net) alert you when a site goes down and again when it recovers, with a one-tap link that opens the monitor directly to that site's detail pane.
+
 ![PiPing panel](screenshot.png)
 
 ---
@@ -17,6 +19,8 @@ Also serves a **web panel** on port 8080 so you can check status from any browse
 
 > **Display driver note:** the working driver is `fbtft` / `mhs35` overlay presenting as `fb_ili9486`. The modern DRM `panel-mipi-dbi` / `st7796s` driver does **not** work with this board — the FPGA bridge doesn't behave like a bare ST7796S. Do not attempt to use it.
 
+> **Power supply:** use a dedicated USB charger rated at 2.5A / 5.1V (or the official Pi PSU). A laptop dock USB port is not enough current — the Pi will brown out under load (polling + WiFi + LCD backlight), causing connection drops and risk of SD card corruption.
+
 ---
 
 ## How it works
@@ -26,6 +30,8 @@ Also serves a **web panel** on port 8080 so you can check status from any browse
 - **`agent/status.php`** — deploy to each web host you want server stats from. Reports CPU load, memory, and disk via non-root methods (works on shared hosting). Sites without an agent get HTTP-only checks.
 - **`pi/monitor.service`** — systemd unit for autostart on boot.
 - **`deploy.sh`** — rsync `pi/` from your dev machine to the Pi and restart the service.
+
+When the Pi itself loses internet (all sites fail simultaneously with network errors), all dots go grey rather than red, and push notifications are suppressed — so you don't get flooded with false alerts during a local outage.
 
 ---
 
@@ -73,13 +79,17 @@ mkdir -p /home/sable/pi-status-panel/pi
 
 ### 4. WiFi stability (recommended for always-on use)
 
-Raspberry Pi WiFi has power-saving enabled by default, which can drop the connection when idle. Disable it permanently:
+Raspberry Pi WiFi has power-saving enabled by default, which drops the connection when idle. Disable it by patching the connection profile directly:
 
 ```bash
-sudo mkdir -p /etc/NetworkManager/conf.d
-echo -e '[connection]\nwifi.powersave=2' | sudo tee /etc/NetworkManager/conf.d/wifi-pm-off.conf
-sudo systemctl restart NetworkManager
+# Find your Wi-Fi connection name:
+nmcli connection show
+
+# Disable power-save on it (replace 'YOUR-WIFI-NAME' with the name shown above):
+sudo nmcli connection modify 'YOUR-WIFI-NAME' 802-11-wireless.powersave 2
 ```
+
+> **Note:** editing `/etc/NetworkManager/conf.d/` does *not* reliably override an existing connection profile that has `powersave` set explicitly. The `nmcli` command above patches the profile itself and persists across reboots.
 
 ### 5. Enable persistent logging (optional but useful)
 
@@ -148,6 +158,9 @@ Copy `pi/config.json.sample` to `pi/config.json` and edit it. The file is gitign
   "http_timeout_seconds": 10,
   "web_port": 8080,
   "web_token": "CHANGE-ME-to-a-long-random-string",
+  "web_base_url": "http://yoursubdomain.duckdns.org",
+  "pushover_app_token": "",
+  "pushover_user_key": "",
   "agent_token": "CHANGE-ME-to-a-long-random-string",
   "screenshot_api_token": "",
 
@@ -179,7 +192,10 @@ Copy `pi/config.json.sample` to `pi/config.json` and edit it. The file is gitign
 |-------|-------------|
 | `web_port` | Port for the web panel (default `8080`) |
 | `web_token` | Cookie-based auth token for the web panel. Leave empty to disable auth (LAN-only installs). |
-| `agent_token` | Shared secret for the PHP status agents |
+| `web_base_url` | Public base URL of the web panel (e.g. `http://yoursubdomain.duckdns.org`). Used to build deep links in push notifications. Leave empty to omit links. |
+| `pushover_app_token` | Pushover application token (create an app at pushover.net). Leave empty to disable notifications. |
+| `pushover_user_key` | Your Pushover user key. |
+| `agent_token` | Shared secret for the PHP status agents. |
 | `screenshot_api_token` | [screenshotapi.net](https://screenshotapi.net) token for thumbnails in the detail view. Leave empty to disable. |
 | `name` | Display name (keep short) |
 | `url` | Full URL for the outsider HTTP check |
@@ -187,7 +203,7 @@ Copy `pi/config.json.sample` to `pi/config.json` and edit it. The file is gitign
 | `grep` | A phrase that must appear in the page HTML for the page check to go green. Leave empty to skip. |
 | `skip_disk` | Set `true` to hide disk gauges (useful for unlimited/shared hosting where the reported value is unreliable) |
 
-The **host light** (left dot) goes green if the server responds at all. The **page light** (right dot) goes green if the response is HTTP 200 and the grep phrase is found (or no phrase is set).
+The **host light** (left dot) goes green if the server responds at all. The **page light** (right dot) goes green if the response is HTTP 200 and the grep phrase is found (or no phrase is set). Both dots go **grey** when the Pi itself has lost internet.
 
 ---
 
@@ -252,7 +268,32 @@ To access the panel from outside your home network:
    ```
    Then access the panel at `http://YOURSUBDOMAIN.duckdns.org`.
 
-3. Set a `web_token` — don't expose the panel to the internet without auth.
+3. Set `web_token` and `web_base_url` — don't expose the panel to the internet without auth.
+
+---
+
+## Push notifications
+
+PiPing can send push notifications to your phone via [Pushover](https://pushover.net) (one-time $5 app purchase).
+
+**Setup:**
+
+1. Create a free account at [pushover.net](https://pushover.net) and note your **user key**.
+2. Create a new application in the Pushover dashboard and note the **app token**.
+3. Add both to `pi/config.json`:
+   ```json
+   "pushover_app_token": "your-app-token",
+   "pushover_user_key": "your-user-key"
+   ```
+4. Set `web_base_url` to your public panel URL so notifications include a working deep link.
+
+**Behaviour:**
+
+- A site must go red on **two consecutive polls** before a DOWN alert fires (avoids false alarms from transient blips).
+- When the site recovers, a BACK UP notification fires.
+- Notifications include the site URL in the message body and an **"Open monitor"** button that links directly to that site's detail pane — including a one-tap auth token so you land straight in without a login screen.
+- Alert state is persisted to `notif_state.json` so recovery notifications fire correctly even after a service restart.
+- If the Pi itself loses internet (all sites fail simultaneously), notifications are suppressed entirely.
 
 ---
 
