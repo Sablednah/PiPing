@@ -1,6 +1,6 @@
 # PiPing
 
-A site-monitoring kiosk for a Raspberry Pi 3B+ with a 3.5" SPI touchscreen. Displays a scrollable grid of monitored websites — status lights, response checks, grep phrase validation, and live server gauges (CPU / memory / disk) from an optional PHP agent on each host.
+A site-monitoring kiosk for a Raspberry Pi with a 3.5" SPI touchscreen. Displays a scrollable grid of monitored websites — status lights, response checks, grep phrase validation, and live server gauges (CPU / memory / disk) from an optional PHP agent on each host.
 
 Also serves a **web panel** on port 8080 so you can check status from any browser, with the same dark-theme grid, history sparklines, and screenshot thumbnails.
 
@@ -14,12 +14,12 @@ Push notifications via [Pushover](https://pushover.net) alert you when a site go
 
 | Part | Notes |
 |------|-------|
-| Raspberry Pi 3B+ | 1 GB RAM |
-| Waveshare-style 3.5" Display-G | 480×320, ST7796S silkscreen, GW1NZ-1 FPGA bridge, XPT2046 touch |
+| Raspberry Pi 4B (or 3B+) | 4B recommended — more headroom for future use |
+| [Aurevita 3.5" SPI Touchscreen](https://www.amazon.co.uk/Aurevita-Raspberry-Pi-Screen-Touchscreen/dp/B0DQ869VHP/) | 480×320, plugs directly onto the 40-pin GPIO header |
+| MicroSD card | 16 GB or larger, A1/A2 rated |
+| Official Pi power supply | Pi 4: USB-C 3A. Pi 3: micro-USB 2.5A. Do not use laptop dock USB — not enough current |
 
-> **Display driver note:** the working driver is `fbtft` / `mhs35` overlay presenting as `fb_ili9486`. The modern DRM `panel-mipi-dbi` / `st7796s` driver does **not** work with this board — the FPGA bridge doesn't behave like a bare ST7796S. Do not attempt to use it.
-
-> **Power supply:** use a dedicated USB charger rated at 2.5A / 5.1V (or the official Pi PSU). A laptop dock USB port is not enough current — the Pi will brown out under load (polling + WiFi + LCD backlight), causing connection drops and risk of SD card corruption.
+The display plugs directly onto the Pi's 40-pin GPIO header — no soldering or wiring needed.
 
 ---
 
@@ -35,16 +35,64 @@ When the Pi itself loses internet (all sites fail simultaneously with network er
 
 ---
 
-## First-time Pi setup
+## Part 1 — Prepare the Pi
 
-### 1. Display driver (if not already configured)
+### Flash the OS
 
-In `/boot/firmware/config.txt`, ensure KMS is off and the `mhs35` overlay is loaded:
+Download and run [Raspberry Pi Imager](https://www.raspberrypi.com/software/).
+
+- **OS:** Raspberry Pi OS (64-bit) — the full desktop image or Lite both work. Lite is leaner for a kiosk.
+- **Storage:** your MicroSD card.
+
+In the Imager's settings (click the gear icon before writing), configure:
+- Hostname (e.g. `pi3-touch`)
+- Username and password
+- Your WiFi SSID and password
+- Enable SSH
+
+Write the card, insert it into the Pi, and boot. Once it's up, find its IP on your router or use `ping pi3-touch.local`, then SSH in:
+
+```bash
+ssh sable@<pi-ip>
+```
+
+### Install the Python dependency
+
+```bash
+sudo apt update && sudo apt install python3-pyqt6 -y
+```
+
+---
+
+## Part 2 — Set up the display
+
+The 3.5" SPI display uses the `fbtft` / `mhs35` driver, which **ships built into Raspberry Pi OS** on current 64-bit Bookworm kernels — no downloading or compiling needed. You can confirm the overlay is present:
+
+```bash
+ls /boot/firmware/overlays/mhs35.dtbo
+```
+
+> **Driver note:** the working driver is `fbtft` / `mhs35` presenting as `fb_ili9486`. The modern DRM `panel-mipi-dbi` / `st7796s` driver does **not** work with this screen — the GW1NZ-1 FPGA bridge on the board doesn't behave like a bare ST7796S. Do not attempt to use it.
+
+### Edit `/boot/firmware/config.txt`
+
+Open the file:
+
+```bash
+sudo nano /boot/firmware/config.txt
+```
+
+Make these changes:
+
+1. **Comment out the KMS driver line** (it conflicts with fbtft). Find and comment out:
+   ```
+   # dtoverlay=vc4-kms-v3d
+   ```
+   (It may already be commented out or absent — that's fine.)
+
+2. **Add the following block at the very end of the file**, after any existing `[all]` section or at the bottom:
 
 ```
-# Comment out or remove this line:
-# dtoverlay=vc4-kms-v3d
-
 [all]
 dtparam=spi=on
 dtparam=i2c_arm=on
@@ -57,29 +105,51 @@ hdmi_cvt 480 320 60 6 0 0 0
 hdmi_drive=2
 ```
 
-In `/boot/firmware/cmdline.txt`, add to the **single existing line** (do not add a new line):
+Save and exit (`Ctrl+O`, `Ctrl+X`).
 
-```
-fbcon=map:10 fbcon=font:ProFont6x11
-```
-
-Reboot. You should see `/dev/fb1` appear.
-
-### 2. Install Python dependency
+### Edit `/boot/firmware/cmdline.txt`
 
 ```bash
-sudo apt install python3-pyqt6 -y
+sudo nano /boot/firmware/cmdline.txt
 ```
 
-### 3. Create the app directory
+This file contains a **single long line**. Do not add a new line — append to the end of the existing line with a space:
+
+```
+fbcon=map:10 fbcon=font:ProFont6x11 vt.global_cursor_default=0
+```
+
+- `fbcon=map:10` — directs the Linux console to the SPI display (fb1) instead of HDMI.
+- `fbcon=font:ProFont6x11` — sets a readable small font for the console.
+- `vt.global_cursor_default=0` — permanently hides the blinking cursor so it doesn't show through the app.
+
+Save and exit.
+
+### Reboot and verify
 
 ```bash
-mkdir -p /home/sable/pi-status-panel/pi
+sudo reboot
 ```
 
-### 4. WiFi stability (recommended for always-on use)
+After reboot, SSH back in and check:
 
-Raspberry Pi WiFi has power-saving enabled by default, which drops the connection when idle. Disable it by patching the connection profile directly:
+```bash
+ls /dev/fb*
+# Should show: /dev/fb0  /dev/fb1
+# fb1 is your SPI display
+
+# Confirm it's the right driver:
+cat /sys/class/graphics/fb1/name
+# Should show: fb_ili9486
+```
+
+If you see `/dev/fb1` named `fb_ili9486`, the display is working. The touchscreen registers automatically as an input device (`ads7846` module).
+
+---
+
+## Part 3 — WiFi stability
+
+Raspberry Pi WiFi has power-saving enabled by default, which drops the connection when idle. For an always-on kiosk this causes the Pi to disappear from the network periodically. Disable it by patching the connection profile directly:
 
 ```bash
 # Find your Wi-Fi connection name:
@@ -89,9 +159,11 @@ nmcli connection show
 sudo nmcli connection modify 'YOUR-WIFI-NAME' 802-11-wireless.powersave 2
 ```
 
-> **Note:** editing `/etc/NetworkManager/conf.d/` does *not* reliably override an existing connection profile that has `powersave` set explicitly. The `nmcli` command above patches the profile itself and persists across reboots.
+> **Note:** the `/etc/NetworkManager/conf.d/` approach does *not* reliably override a connection profile that has `powersave` set explicitly. The `nmcli` command above patches the profile itself and persists across reboots.
 
-### 5. Enable persistent logging (optional but useful)
+---
+
+## Part 4 — Persistent logging (optional but useful)
 
 Lets you inspect logs from previous boots if the Pi drops off the network:
 
@@ -103,29 +175,39 @@ sudo systemctl restart systemd-journald
 
 ---
 
-## Deploying the app
+## Part 5 — Deploy the app
 
-Clone this repo on your **development machine** (not the Pi — it only has 1 GB RAM):
+All code editing happens on your **development machine** (laptop/desktop), not on the Pi. The Pi only runs the deployed result.
+
+### Clone the repo (on your dev machine)
 
 ```bash
 git clone https://github.com/Sablednah/PiPing.git
 cd PiPing
 ```
 
-Copy the sample config and edit it — at minimum set a strong `agent_token` and add your sites (see [Configuration](#configuration) below):
+### Create your config
 
 ```bash
 cp pi/config.json.sample pi/config.json
 ```
 
-`pi/config.json` is gitignored so your live site list and tokens stay local.
+Edit `pi/config.json` — at minimum set a strong `agent_token` and add your sites. See [Configuration](#configuration) below.
 
-Push to the Pi:
+`pi/config.json` is gitignored so your live site list and tokens stay off GitHub.
+
+### Create the app directory on the Pi
+
+```bash
+ssh sable@<pi-ip> "mkdir -p /home/sable/pi-status-panel/pi"
+```
+
+### Push to the Pi
 
 ```bash
 ./deploy.sh
 # or with an explicit host:
-./deploy.sh sable@192.168.1.x
+./deploy.sh sable@<pi-ip>
 ```
 
 The default host is `sable@192.168.6.130` — edit `deploy.sh` to change it.
@@ -145,6 +227,8 @@ After the first install, `deploy.sh` handles restarting the service automaticall
 ```bash
 ssh sable@<pi-ip> "journalctl -fu monitor.service"
 ```
+
+You should see `[web] listening on http://0.0.0.0:8080` within a few seconds of start.
 
 ---
 
@@ -190,6 +274,8 @@ Copy `pi/config.json.sample` to `pi/config.json` and edit it. The file is gitign
 
 | Field | Description |
 |-------|-------------|
+| `poll_interval_seconds` | How often to check all sites (default `30`) |
+| `http_timeout_seconds` | Per-request timeout (default `10`) |
 | `web_port` | Port for the web panel (default `8080`) |
 | `web_token` | Cookie-based auth token for the web panel. Leave empty to disable auth (LAN-only installs). |
 | `web_base_url` | Public base URL of the web panel (e.g. `http://yoursubdomain.duckdns.org`). Used to build deep links in push notifications. Leave empty to omit links. |
@@ -221,7 +307,7 @@ The agent gives you live CPU / memory / disk gauges for each host.
 
 3. Use the **same token** in `pi/config.json` → `agent_token`.
 
-4. Test from the Pi:
+4. Test from your dev machine or the Pi:
    ```bash
    curl -H "X-Status-Token: YOUR_TOKEN" https://example.com/_status/status.php
    ```
@@ -259,28 +345,29 @@ To access the panel from outside your home network:
 2. **Dynamic DNS** (if your IP isn't static) — [DuckDNS](https://www.duckdns.org) is free and easy:
    ```bash
    mkdir -p ~/duckdns
-   # Create ~/duckdns/duck.sh:
-   echo 'url="https://www.duckdns.org/update?domains=YOURSUBDOMAIN&token=YOUR_TOKEN&ip="' \
-     | curl -k -o ~/duckdns/duck.log -K -
+   cat > ~/duckdns/duck.sh << 'EOF'
+   url="https://www.duckdns.org/update?domains=YOURSUBDOMAIN&token=YOUR_TOKEN&ip="
+   curl -k -o ~/duckdns/duck.log -K - <<< "url=$url"
+   EOF
    chmod 700 ~/duckdns/duck.sh
    # Add to cron (every 5 minutes):
    (crontab -l; echo '*/5 * * * * bash ~/duckdns/duck.sh >/dev/null 2>&1') | crontab -
    ```
-   Then access the panel at `http://YOURSUBDOMAIN.duckdns.org`.
+   Then set `web_base_url` in `config.json` to `http://YOURSUBDOMAIN.duckdns.org` and access the panel at that URL.
 
-3. Set `web_token` and `web_base_url` — don't expose the panel to the internet without auth.
+3. Set `web_token` — don't expose the panel to the internet without auth.
 
 ---
 
 ## Push notifications
 
-PiPing can send push notifications to your phone via [Pushover](https://pushover.net) (one-time $5 app purchase).
+PiPing can send push notifications to your phone via [Pushover](https://pushover.net) (one-time ~$5 app purchase, free trial available).
 
 **Setup:**
 
 1. Create a free account at [pushover.net](https://pushover.net) and note your **user key**.
 2. Create a new application in the Pushover dashboard and note the **app token**.
-3. Add both to `pi/config.json`:
+3. Add both to `pi/config.json` and redeploy:
    ```json
    "pushover_app_token": "your-app-token",
    "pushover_user_key": "your-user-key"
@@ -289,7 +376,7 @@ PiPing can send push notifications to your phone via [Pushover](https://pushover
 
 **Behaviour:**
 
-- A site must go red on **two consecutive polls** before a DOWN alert fires (avoids false alarms from transient blips).
+- A site must go red on **4 consecutive polls** (~2 minutes) before a DOWN alert fires — avoids false alarms from transient blips.
 - When the site recovers, a BACK UP notification fires.
 - Notifications include the site URL in the message body and an **"Open monitor"** button that links directly to that site's detail pane — including a one-tap auth token so you land straight in without a login screen.
 - Alert state is persisted to `notif_state.json` so recovery notifications fire correctly even after a service restart.
@@ -301,7 +388,7 @@ PiPing can send push notifications to your phone via [Pushover](https://pushover
 
 | Action | Result |
 |--------|--------|
-| Swipe up/down | Scroll the site list |
+| Swipe up / down | Scroll the site list |
 | Tap a site row | Open detail view (HTTP status, response time, title, grep result, server stats, history, screenshot) |
 | Tap anywhere in detail | Return to grid |
 | Tap the **"Site Status"** header | Force an immediate repoll |
@@ -326,4 +413,12 @@ Edit files on your dev machine, then:
 ./deploy.sh
 ```
 
-This rsyncs `pi/` to the Pi and restarts the service. `pi/config.json` and `pi/history.json` are excluded from the sync so live data on the Pi is never overwritten. If you change `monitor.service` itself, re-run the install command above to copy it into `/etc/systemd/system/` and reload systemd.
+This rsyncs `pi/` to the Pi and restarts the service. `pi/config.json`, `pi/history.json`, and `pi/notif_state.json` are excluded from the sync so live data on the Pi is never overwritten.
+
+If you change `monitor.service` itself, re-run the install command above to copy it into `/etc/systemd/system/` and reload systemd.
+
+To run the app manually on the Pi for testing:
+
+```bash
+QT_QPA_PLATFORM=linuxfb:fb=/dev/fb1 python3 monitor.py
+```
