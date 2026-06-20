@@ -66,13 +66,24 @@ sudo apt update && sudo apt install python3-pyqt6 -y
 
 ## Part 2 — Set up the display
 
-The 3.5" SPI display uses the `fbtft` / `mhs35` driver, which **ships built into Raspberry Pi OS** on current 64-bit Bookworm kernels — no downloading or compiling needed. You can confirm the overlay is present:
+The 3.5" SPI display uses the `fbtft` / `mhs35` driver. The `fbtft` module ships with Raspberry Pi OS, but the `mhs35` overlay file itself is **not** included — you need to install it first.
+
+> **Driver note:** the working driver is `fbtft` / `mhs35` presenting as `fb_ili9486`. The modern DRM `panel-mipi-dbi` / `st7796s` driver does **not** work with this screen — the GW1NZ-1 FPGA bridge on the board doesn't behave like a bare ST7796S. Do not attempt to use it.
+
+### Install the mhs35 overlay
+
+The overlay comes from the [goodtft/LCD-show](https://github.com/goodtft/LCD-show) project. Download it directly to the overlays directory:
+
+```bash
+sudo wget -O /boot/firmware/overlays/mhs35.dtbo \
+  https://raw.githubusercontent.com/goodtft/LCD-show/master/usr/mhs35-overlay.dtb
+```
+
+Verify it's in place:
 
 ```bash
 ls /boot/firmware/overlays/mhs35.dtbo
 ```
-
-> **Driver note:** the working driver is `fbtft` / `mhs35` presenting as `fb_ili9486`. The modern DRM `panel-mipi-dbi` / `st7796s` driver does **not** work with this screen — the GW1NZ-1 FPGA bridge on the board doesn't behave like a bare ST7796S. Do not attempt to use it.
 
 ### Edit `/boot/firmware/config.txt`
 
