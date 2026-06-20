@@ -139,7 +139,7 @@ def _check_notifications(results: list):
         is_red = not r.host_ok or not r.page_ok
         if is_red:
             _notif_consecutive[key] = _notif_consecutive.get(key, 0) + 1
-            if _notif_consecutive[key] == 2 and key not in _notif_alerted:
+            if _notif_consecutive[key] == 4 and key not in _notif_alerted:
                 _notif_alerted.add(key)
                 _save_notif_state()
                 msg = r.error or ("host unreachable" if not r.host_ok else "page check failed")
