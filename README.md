@@ -15,7 +15,7 @@ Push notifications via [Pushover](https://pushover.net) alert you when a site go
 | Part | Notes |
 |------|-------|
 | Raspberry Pi 4B (or 3B+) | 4B recommended — more headroom for future use |
-| [Aurevita 3.5" SPI Touchscreen](https://www.amazon.co.uk/Aurevita-Raspberry-Pi-Screen-Touchscreen/dp/B0DQ869VHP/) | 480×320, plugs directly onto the 40-pin GPIO header |
+| [Aurevita 3.5" SPI Touchscreen](https://www.amazon.co.uk/Aurevita-Raspberry-Pi-Screen-Touchscreen/dp/B0DQ869VHP?th=1&linkCode=ll2&tag=sablednah-21&linkId=6100f31709efb99c95130111414e04eb&ref_=as_li_ss_tl) | 480×320, plugs directly onto the 40-pin GPIO header |
 | MicroSD card | 16 GB or larger, A1/A2 rated |
 | Official Pi power supply | Pi 4: USB-C 3A. Pi 3: micro-USB 2.5A. Do not use laptop dock USB — not enough current |
 
